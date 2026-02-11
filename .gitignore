@@ -1,0 +1,22 @@
+# runtime/cache
+__pycache__/
+*.pyc
+.cellpose_server_data/
+*.log
+*.tmp
+
+# local envs
+.venv/
+env/
+*.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# cluster/local artifacts
+*.o*
+*.e*
+x:/home/

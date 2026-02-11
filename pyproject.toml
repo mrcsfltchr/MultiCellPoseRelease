@@ -1,0 +1,146 @@
+[build-system]
+requires = [
+  "setuptools>=68",
+  "setuptools-scm[toml]>=8",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multicellpose"
+description = "MultiCellPose: segmentation and analysis toolkit for multimodal microscopy"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Marcus Fletcher" },
+]
+keywords = ["multicellpose", "segmentation", "microscopy", "microfluidics", "synthetic-biology", "gRPC", "PyQt"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+  "numpy>=1.20.0",
+  "scipy",
+  "protobuf",
+  "grpcio",
+  "natsort",
+  "tifffile",
+  "tqdm",
+  "torch>=1.6",
+  "torchvision",
+  "opencv-python-headless",
+  "fastremap",
+  "imagecodecs",
+  "roifile",
+  "fill-voids",
+  "segment_anything",
+  "pandas",
+  "nd2",
+  "pynrrd",
+  "readlif",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+image = [
+  "nd2",
+  "pynrrd",
+  "readlif",
+]
+gui = [
+  "pyqtgraph>=0.12.4",
+  "pyqt6",
+  "pyqt6.sip",
+  "qtpy",
+  "superqt",
+  "nd2",
+  "pynrrd",
+  "readlif",
+]
+remote = [
+  "grpcio",
+  "grpcio-tools",
+]
+docs = [
+  "sphinx>=3.0",
+  "sphinxcontrib-apidoc",
+  "sphinx_rtd_theme",
+  "sphinx-argparse",
+]
+distributed = [
+  "dask",
+  "distributed",
+  "dask_image",
+  "pyyaml",
+  "zarr",
+  "dask_jobqueue",
+  "bokeh",
+  "pyarrow",
+]
+bioimageio = [
+  "bioimageio.core",
+]
+dev = [
+  "pytest",
+  "build",
+  "twine",
+  "ruff",
+]
+all = [
+  "nd2",
+  "pynrrd",
+  "readlif",
+  "pyqtgraph>=0.12.4",
+  "pyqt6",
+  "pyqt6.sip",
+  "qtpy",
+  "superqt",
+  "grpcio",
+  "grpcio-tools",
+  "sphinx>=3.0",
+  "sphinxcontrib-apidoc",
+  "sphinx_rtd_theme",
+  "sphinx-argparse",
+  "dask",
+  "distributed",
+  "dask_image",
+  "pyyaml",
+  "zarr",
+  "dask_jobqueue",
+  "bokeh",
+  "pyarrow",
+  "bioimageio.core",
+]
+
+[project.urls]
+Homepage = "https://github.com/mrcsfltchr/MultiCellPose"
+Repository = "https://github.com/mrcsfltchr/MultiCellPose"
+Issues = "https://github.com/mrcsfltchr/MultiCellPose/issues"
+
+[project.scripts]
+multicellpose-gui = "guv_app.main:main"
+multicellpose-server = "run_server:main"
+multicellpose-train = "train_headless:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["train_headless", "run_server"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cellpose*", "guv_app*", "cpgrpc*"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+local_scheme = "no-local-version"

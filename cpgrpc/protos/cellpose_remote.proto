@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package cellpose.remote;
+
+// Basic health check
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  string status = 1; // e.g., "SERVING"
+}
+
+// File transfer to register training/inference data
+service FileService {
+  rpc Upload(stream FileChunk) returns (UploadReply);
+  rpc Download(DownloadRequest) returns (stream FileChunk);
+}
+
+message DownloadRequest {
+  string uri = 1; // URI of the file to download
+}
+
+message FileChunk {
+  string project_id = 1;
+  string relpath = 2; // relative path under project root
+  bytes data = 3;
+  int64 offset = 4;   // byte offset for resumable uploads
+}
+
+message UploadReply {
+  string uri = 1;           // server URI to the stored file
+  int64 bytes_received = 2; // total bytes written
+}
+
+// Inference on one or more images (batch supported)
+service InferenceService {
+  rpc Run(RunRequest) returns (stream JobUpdate);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated string model_ids = 1;
+}
+
+
+message RunRequest {
+  string project_id = 1;
+  repeated string uris = 2; // image URIs registered on server
+  string model_id = 3;      // model identifier known to server
+
+  // Optional segmentation parameters
+  optional float diameter = 4;
+  optional float cellprob_threshold = 5;
+  optional float flow_threshold = 6;
+  optional bool do_3D = 7;
+  optional int32 niter = 8;
+  optional float stitch_threshold = 9;
+  optional float anisotropy = 10;
+  optional float flow3D_smooth = 11;
+  optional int32 min_size = 12;
+  optional float max_size_fraction = 13;
+  optional string normalize_params = 14; // JSON string
+  optional int32 z_axis = 15;
+  optional int32 channel_axis = 16;
+}
+
+message JobUpdate {
+  int32 progress = 1;   // 0..100
+  string stage = 2;     // e.g., "queue", "preprocess", "infer", "postprocess"
+  string message = 3;   // free-form log line
+  string result_uri = 4; // optional: URI to output (e.g., *_seg.npy)
+}
+
+
