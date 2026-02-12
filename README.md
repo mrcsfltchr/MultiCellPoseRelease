@@ -61,7 +61,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 #### Step 3: Install MultiCellPose
 
 ```
-pip install multicellpose
+pip install multicellpose[gui]
 ```
 
 This installs GUI, server/client communication dependencies, and image readers (`.nd2`, `.lif`, `.nrrd`) by default.
