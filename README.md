@@ -1,4 +1,4 @@
-## MultiCellPose:  Trainer + Analyzer
+﻿## MultiCellPose:  Trainer + Analyzer
 
 ![MultiCellPose Front End](MultiCellPoseFrontEnd.gif)
 
@@ -215,10 +215,16 @@ The Analyzer app is for running inference across a folder, optionally correcting
 2) Start the gRPC server:
 
 ```
-python run_server.py
+multicellpose-server
 ```
 
 By default it listens on `127.0.0.1:50051` (see `run_server.py`) for secure local-only access.
+To expose on all interfaces, run:
+
+```
+multicellpose-server --host 0.0.0.0
+```
+
 If you need LAN/WAN exposure, set `server_bind` explicitly and protect it with firewall rules plus strong auth.
 
 ### Remote configuration (optional)
@@ -571,5 +577,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\test_install_windows_cuda121.
 4. Create a GitHub Release (tag), which triggers publish.
 
 The publish workflow uses OIDC and does not require a PyPI API token secret.
+
 
 
