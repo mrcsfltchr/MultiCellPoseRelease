@@ -88,7 +88,7 @@ If you already have Git:
 
 ```
 cd C:\Projects
-git clone https://github.com/mrcsfltchr/MultiCellPose.git
+git clone https://github.com/mrcsfltchr/MultiCellPoseRelease.git
 cd MultiCellPose
 ```
 
