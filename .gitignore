@@ -1,22 +1,55 @@
-# runtime/cache
+# Python cache/bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Build/distribution
+.Python
+build/
+dist/
+sdist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# Testing/coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+*.env
+
+# Runtime/local data
 .cellpose_server_data/
+remote_config.json
+models/
 *.log
 *.tmp
 
-# local envs
-.venv/
-env/
-*.env
-
-# OS/editor
-.DS_Store
-Thumbs.db
+# Editor/OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
 
-# cluster/local artifacts
+# Platform/local artifacts
 *.o*
 *.e*
 x:/home/

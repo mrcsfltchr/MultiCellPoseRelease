@@ -119,7 +119,6 @@ setup(
         'all': gui_deps + distributed_deps + image_deps + bioimageio_deps,
     }, include_package_data=True, classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
         "Operating System :: OS Independent",
     ], entry_points={'console_scripts': [
         'multicellpose-gui = guv_app.main:main',

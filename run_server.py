@@ -1,4 +1,5 @@
-﻿import signal
+
+import signal
 import logging
 import sys
 import argparse
@@ -56,7 +57,6 @@ def main():
     finally:
         server.stop(0)
         _logger.info("Server stopped.")
-
 
 if __name__ == "__main__":
     main()

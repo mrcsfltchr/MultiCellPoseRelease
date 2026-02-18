@@ -4,6 +4,8 @@
 
 This repository provides a GUI workflow for labeling, remote inference, and training CellposeSAM-based multi-class segmentation models, plus an Analyzer app which allows running custom models and performing custom analysis plugins on detected objects.. It supports local or remote (SSH + gRPC) compute. Note: currently you will need to run the server yourself if you have a remote gpu-enable ssh server.
 
+License note: MultiCellPose is distributed under BSD-3-Clause and includes upstream Cellpose components. Original Cellpose copyright remains in `LICENSE` (Copyright (c) 2020 Howard Hughes Medical Institute).
+
 ---
 
 ## 1) Installation
@@ -416,7 +418,7 @@ module load cuda/12.1
 
 2. Clone the repo:
 ```
-git clone https://github.com/mrcsfltchr/MultiCellPose.git
+git clone https://github.com/mrcsfltchr/MultiCellPoseRelease.git
 cd MultiCellPose
 ```
 
@@ -577,6 +579,3 @@ powershell -ExecutionPolicy Bypass -File .\scripts\test_install_windows_cuda121.
 4. Create a GitHub Release (tag), which triggers publish.
 
 The publish workflow uses OIDC and does not require a PyPI API token secret.
-
-
-
