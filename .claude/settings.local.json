@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git ls-tree:*)",
+      "Bash(done)",
+      "Bash(git checkout:*)",
+      "Bash(where:*)",
+      "Bash(py -3 -m pytest:*)",
+      "WebFetch(domain:icl-rcs-user-guide.readthedocs.io)"
+    ]
+  }
+}

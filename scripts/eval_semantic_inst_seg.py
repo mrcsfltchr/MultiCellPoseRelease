@@ -151,9 +151,20 @@ def iter_eval_frames(path: Path):
 
 
 def _label_stems(base: Path, frame_id: Optional[str]) -> list[str]:
-    stems = [base.stem]
-    if frame_id:
-        stems.insert(0, f"{base.stem}__{frame_id}")
+    """Candidate label stems for a given image path/frame.
+
+    Supports standard "<stem>_masks.*" as well as Cellpose test naming where
+    images are "<id>_img.*" and labels are "<id>_masks.*".
+    """
+    roots = [base.stem]
+    if base.stem.endswith("_img") and len(base.stem) > 4:
+        roots.append(base.stem[:-4])
+
+    stems: list[str] = []
+    for root in roots:
+        if frame_id:
+            stems.append(f"{root}__{frame_id}")
+        stems.append(root)
     return stems
 
 
@@ -171,11 +182,12 @@ def load_gt_masks(base: Path, frame_id: Optional[str] = None) -> Optional[np.nda
                     return masks.astype(np.int32, copy=False)
             except Exception:
                 pass
-        for suf in ("_masks.tif", "_masks.tiff"):
-            tif_path = base.with_suffix("").with_name(stem + suf)
-            if tif_path.exists():
+        for suf in ("_masks.tif", "_masks.tiff", "_masks.png"):
+            mask_path = base.with_suffix("").with_name(stem + suf)
+            if mask_path.exists():
                 try:
-                    masks = tiff.imread(str(tif_path))
+                    # Use Cellpose IO for broad image-format support (incl. PNG).
+                    masks = cp_io.imread(str(mask_path))
                     if masks.ndim == 3:
                         masks = masks.squeeze()
                     return masks.astype(np.int32, copy=False)
@@ -208,14 +220,15 @@ def load_gt_classes_map(
                     class_map = classes[gt_masks]
                     return class_map.astype(np.int32, copy=False)
             except Exception:
-                return None
+                # Fall back to sidecar *_classes.tif when *_seg.npy is unreadable.
+                pass
 
         # Fallback: sidecar class map TIFF (legacy datasets)
-        for suf in ("_classes.tif", "_classes.tiff"):
-            tif_path = base.with_suffix("").with_name(stem + suf)
-            if tif_path.exists():
+        for suf in ("_classes.tif", "_classes.tiff", "_classes.png"):
+            cls_path = base.with_suffix("").with_name(stem + suf)
+            if cls_path.exists():
                 try:
-                    class_map = tiff.imread(str(tif_path))
+                    class_map = cp_io.imread(str(cls_path))
                     if class_map.ndim == 3:
                         class_map = class_map.squeeze()
                     return class_map.astype(np.int32, copy=False)
@@ -1119,6 +1132,10 @@ def main() -> None:
 
             t_metrics0 = time.time()
             gt_cm = load_gt_classes_map(img_path, gt_masks=gt, frame_id=frame_id)
+            # Cellpose-style benchmark sets often provide only *_masks labels.
+            # When no class map is present, treat all labeled objects as class 1.
+            if gt_cm is None:
+                gt_cm = np.where(gt > 0, 1, 0).astype(np.int32, copy=False)
             gt_inst_cls = get_instance_classes(gt, gt_cm)
             pred_inst_cls = get_instance_classes(pred, pred_cm)
             pred_cls_vec, gt_cls_vec = _aligned_instance_class_vectors(
