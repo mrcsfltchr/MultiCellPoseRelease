@@ -19,7 +19,9 @@ from cellpose import train as cellpose_train
 
 def _resolve_app_icon() -> Path | None:
     repo_root = Path(__file__).resolve().parents[1]
+    module_root = Path(__file__).resolve().parent
     candidates = [
+        module_root / "assets" / "icons" / "MultiCellPose.png",
         repo_root / "MultiCellPose.png",
         repo_root / "assets" / "icons" / "MultiCellPose.png",
         repo_root / "cellpose" / "logo" / "cellpose.ico",

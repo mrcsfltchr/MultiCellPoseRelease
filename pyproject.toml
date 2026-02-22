@@ -137,6 +137,9 @@ multicellpose-train = "train_headless:main"
 include-package-data = true
 py-modules = ["train_headless", "run_server"]
 
+[tool.setuptools.package-data]
+guv_app = ["assets/icons/*.png"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cellpose*", "guv_app*", "cpgrpc*"]
