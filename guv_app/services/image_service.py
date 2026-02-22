@@ -24,6 +24,7 @@ class ImageService:
         self._save_lock = threading.Lock()
         self._save_cv = threading.Condition(self._save_lock)
         self._pending_saves = {}
+        self._inflight_saves = set()
         self._stop_save_worker = False
         self._save_debounce_s = 0.35
         self._save_worker = threading.Thread(
@@ -770,7 +771,42 @@ class ImageService:
         with self._save_cv:
             # Keep only the latest snapshot per destination file.
             self._pending_saves[path] = save_request
-            self._save_cv.notify()
+            self._save_cv.notify_all()
+
+    def wait_for_saves(self, paths=None, timeout_s=5.0):
+        """
+        Block until background save queue is drained.
+
+        If `paths` is provided, waits only for those destination files.
+        Returns True when drained, False on timeout.
+        """
+        if timeout_s is None:
+            timeout_s = 5.0
+        deadline = time.time() + float(timeout_s)
+        watch = None
+        if paths is not None:
+            watch = {os.path.normcase(os.path.normpath(str(p))) for p in paths if p}
+
+        def _done():
+            if watch is None:
+                return not self._pending_saves and not self._inflight_saves
+            pending_keys = {
+                os.path.normcase(os.path.normpath(str(p)))
+                for p in self._pending_saves.keys()
+            }
+            inflight_keys = {
+                os.path.normcase(os.path.normpath(str(p)))
+                for p in self._inflight_saves
+            }
+            return watch.isdisjoint(pending_keys) and watch.isdisjoint(inflight_keys)
+
+        with self._save_cv:
+            while not _done():
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._save_cv.wait(timeout=remaining)
+        return True
 
     def _save_worker_loop(self):
         while True:
@@ -786,15 +822,22 @@ class ImageService:
                     return
                 batch = list(self._pending_saves.values())
                 self._pending_saves.clear()
+                for _mode, path, _payload in batch:
+                    self._inflight_saves.add(path)
+                self._save_cv.notify_all()
             for save_request in batch:
                 try:
-                    mode, _path, payload = save_request
+                    mode, path, payload = save_request
                     if mode == "seg":
                         self._write_seg_payload(payload)
                     else:
                         self._write_pred_payload(payload)
                 except Exception as e:
                     _logger.error(f"Background save failed: {e}")
+                finally:
+                    with self._save_cv:
+                        self._inflight_saves.discard(path)
+                        self._save_cv.notify_all()
 
     def save_visualization_mask(self, filename, frame_id, masks, plugin_name=None):
         if not filename or masks is None:

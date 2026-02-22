@@ -524,6 +524,7 @@ class MainController(QObject):
 
     def handle_navigate_next(self):
         """Loads the next image in the current folder."""
+        self._autosave_and_flush_before_navigation()
         if self.model.image_files and self.model.current_file_index != -1:
             if self.model.current_file_index < len(self.model.image_files) - 1:
                 next_file = self.model.image_files[self.model.current_file_index + 1]
@@ -533,12 +534,40 @@ class MainController(QObject):
 
     def handle_navigate_prev(self):
         """Loads the previous image in the current folder."""
+        self._autosave_and_flush_before_navigation()
         if self.model.image_files and self.model.current_file_index != -1:
             if self.model.current_file_index > 0:
                 prev_file = self.model.image_files[self.model.current_file_index - 1]
                 self.handle_load_image(prev_file)
             else:
                 self.view.statusBar().showMessage("Start of folder reached.")
+
+    def _autosave_and_flush_before_navigation(self):
+        """
+        Finalize any active stroke, trigger save, and briefly wait for background
+        writes so immediate back-navigation sees the latest labels on disk.
+        """
+        self.handle_finalize_stroke()
+        if not self.model.view_config.autosave_enabled:
+            return
+        if not self.model.filename:
+            return
+
+        # Queue latest snapshot first (seg in Trainer, pred in Analyzer override).
+        self.handle_save_request()
+
+        base_filename, frame_id = self.image_service.split_image_reference(self.model.filename)
+        watch_paths = [
+            self.image_service.build_frame_path(base_filename, frame_id, "_seg.npy"),
+            self.image_service.build_frame_path(base_filename, frame_id, "_pred.npy"),
+        ]
+        drained = self.image_service.wait_for_saves(paths=watch_paths, timeout_s=3.0)
+        if not drained:
+            _logger.warning(
+                "Timed out waiting for autosave before navigation for %s (frame=%s).",
+                base_filename,
+                frame_id,
+            )
 
     def handle_add_ssh_hostname(self):
         """

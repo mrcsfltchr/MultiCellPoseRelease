@@ -204,6 +204,24 @@ class ApplicationStateModel(QObject):
         # Add new masks, offsetting their IDs
         new_mask_ids = np.unique(masks[masks > 0])
         self.ncells += len(new_mask_ids)
+
+        # Some inference outputs (e.g., non-semantic models) persist a classes
+        # vector of all zeros. Treat this as "unlabeled" so GUI defaults each
+        # instance to class 1 instead of hiding all masks as class 0.
+        classes_arr = None
+        if classes is not None:
+            try:
+                classes_arr = np.asarray(classes).reshape(-1)
+                has_labeled_class = False
+                for old_id in new_mask_ids:
+                    oid = int(old_id)
+                    if oid < len(classes_arr) and int(classes_arr[oid]) > 0:
+                        has_labeled_class = True
+                        break
+                if not has_labeled_class:
+                    classes_arr = None
+            except Exception:
+                classes_arr = None
         
         # Create a mapping from old mask IDs in the input array to new global IDs
         id_map = np.zeros(masks.max() + 1, dtype=np.uint16)
@@ -228,11 +246,11 @@ class ApplicationStateModel(QObject):
         if len(self.instance_colors) <= self.ncells:
             self.generate_instance_colors(self.ncells + 1 - len(self.instance_colors))
 
-        if classes is not None:
+        if classes_arr is not None:
             # classes is indexed by old mask ID. Map old IDs to new IDs.
             for old_id, new_id in enumerate(id_map):
-                if old_id > 0 and new_id > 0 and old_id < len(classes):
-                    self.mask_classes[new_id] = classes[old_id]
+                if old_id > 0 and new_id > 0 and old_id < len(classes_arr):
+                    self.mask_classes[new_id] = classes_arr[old_id]
         else:
             for new_mask_id in range(max_id + 1, self.ncells + 1):
                 # Unlabeled imports should default to class 1, not current UI class.
