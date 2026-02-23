@@ -37,11 +37,12 @@ class TrainerView(BaseMainView):
         cancel_action.triggered.connect(self.training_cancel_requested.emit)
         training_menu.addAction(cancel_action)
 
-    def prompt_training_config(self, model_names, default_config, train_files, total_blocks=None):
+    def prompt_training_config(self, model_names, default_config, train_files, train_image_shapes=None, total_blocks=None):
         dialog = TrainingConfigDialog(
             model_names=model_names,
             default_config=default_config,
             train_files=train_files,
+            train_image_shapes=train_image_shapes,
             total_blocks=total_blocks,
             parent=self,
         )

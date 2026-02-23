@@ -22,6 +22,8 @@ class TrainingConfig:
     bsize: int = 256
     rescale: bool = False
     scale_range: float = 0.5
+    seg_loss_weight: float = 0.1
+    nimg_per_epoch: Optional[int] = None
     use_lora: bool = False
     lora_blocks: Optional[int] = None
     unfreeze_blocks: int = 9
