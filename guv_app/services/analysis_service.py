@@ -18,12 +18,25 @@ class AnalysisService:
     """
     def __init__(self):
         self.plugins = {}
+        self.discovery_errors = []
         self.discover_plugins()
 
     def discover_plugins(self, reload_modules: bool = False):
         """Automatically discovers and registers plugins from the plugins package."""
-        self.plugins = {}
-        for _, name, _ in pkgutil.iter_modules(guv_app.plugins.__path__, guv_app.plugins.__name__ + "."):
+        discovered = {}
+        self.discovery_errors = []
+        module_names = [
+            name for _, name, _ in pkgutil.iter_modules(
+                guv_app.plugins.__path__, guv_app.plugins.__name__ + "."
+            )
+        ]
+        skip_modules = {
+            "guv_app.plugins.interface",
+            "guv_app.plugins.validator",
+            "guv_app.plugins.plugin_validator",
+        }
+        plugin_module_names = [name for name in module_names if name not in skip_modules]
+        for name in plugin_module_names:
             try:
                 module = importlib.import_module(name)
                 if reload_modules and name in sys.modules:
@@ -32,16 +45,50 @@ class AnalysisService:
                     if inspect.isclass(obj) and issubclass(obj, AnalysisPlugin):
                         if not inspect.isabstract(obj):
                             try:
-                                self.register_plugin(obj())
+                                self._register_plugin_into(discovered, obj())
                             except Exception as e:
                                 _logger.error(f"Failed to instantiate plugin {obj.__name__} from {name}: {e}")
             except Exception as e:
+                self.discovery_errors.append((name, str(e)))
                 _logger.error(f"Failed to import plugin module {name}: {e}")
+
+        # Fallback explicit imports for core plugins.
+        for name in (
+            "guv_app.plugins.basic_stats",
+            "guv_app.plugins.perimeter_intensity",
+            "guv_app.plugins.object_clusters",
+        ):
+            if name in plugin_module_names:
+                continue
+            try:
+                module = importlib.import_module(name)
+                if reload_modules and name in sys.modules:
+                    module = importlib.reload(module)
+                for _, obj in inspect.getmembers(module):
+                    if inspect.isclass(obj) and issubclass(obj, AnalysisPlugin):
+                        if not inspect.isabstract(obj):
+                            self._register_plugin_into(discovered, obj())
+            except Exception as e:
+                self.discovery_errors.append((name, str(e)))
+                _logger.error(f"Failed fallback import for plugin module {name}: {e}")
+
+        if discovered:
+            self.plugins = discovered
+        elif not self.plugins:
+            _logger.warning("No analysis plugins discovered.")
+        else:
+            _logger.warning(
+                "Plugin rediscovery yielded no plugins; keeping previously discovered plugins (%d).",
+                len(self.plugins),
+            )
 
     def register_plugin(self, plugin: AnalysisPlugin):
         """Registers a new analysis plugin."""
+        self._register_plugin_into(self.plugins, plugin)
+
+    def _register_plugin_into(self, plugin_map: Dict[str, AnalysisPlugin], plugin: AnalysisPlugin):
         name = plugin.name
-        existing = self.plugins.get(name)
+        existing = plugin_map.get(name)
         if existing is not None:
             existing_params = _safe_param_count(existing)
             new_params = _safe_param_count(plugin)
@@ -61,7 +108,7 @@ class AnalysisService:
                 plugin.__class__.__module__,
                 plugin.__class__.__name__,
             )
-        self.plugins[name] = plugin
+        plugin_map[name] = plugin
         _logger.info(
             "Registered analysis plugin: %s (%s.%s, params=%d)",
             name,
