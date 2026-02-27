@@ -15,6 +15,17 @@ class BasicStatsPlugin(AnalysisPlugin):
     def name(self) -> str:
         return "Basic Statistics"
 
+    def get_parameter_definitions(self):
+        return {
+            "intensity_channel": {
+                "type": "enum",
+                "default": "all",
+                "options": ["all", "1", "2", "3"],
+                "label": "Intensity Channel",
+                "help": "'all' averages channels. 1/2/3 selects R/G/B channel.",
+            }
+        }
+
     def run(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> pd.DataFrame:
         if regionprops_table is None:
             raise ImportError("scikit-image is required for BasicStatsPlugin")
@@ -24,10 +35,19 @@ class BasicStatsPlugin(AnalysisPlugin):
 
         # Ensure intensity image matches mask dimensions
         intensity_img = image
-        if image.ndim == 3 and masks.ndim == 2:
-            # If RGB/multichannel, take mean for intensity or use specific channel if provided
-            # For basic stats, we'll just use the mean of channels to get a 2D intensity map
-            intensity_img = image.mean(axis=2)
+        intensity_channel = _parse_intensity_channel(kwargs.get("intensity_channel", "all"))
+        channel_name = _format_intensity_channel_name(intensity_channel)
+        if image.ndim == 2 and masks.ndim == 3 and masks.shape[0] == 1 and image.shape == masks.shape[1:]:
+            intensity_img = image[np.newaxis, ...]
+        elif image.ndim == 3 and masks.ndim == 2:
+            if intensity_channel < 0:
+                intensity_img = image.mean(axis=2)
+            else:
+                if intensity_channel >= image.shape[2]:
+                    raise ValueError(
+                        f"Requested intensity_channel={intensity_channel}, but image has {image.shape[2]} channels"
+                    )
+                intensity_img = image[..., intensity_channel]
         
         props = ['label', 'area', 'mean_intensity', 'centroid']
         data = regionprops_table(masks, intensity_image=intensity_img, properties=props)
@@ -49,4 +69,30 @@ class BasicStatsPlugin(AnalysisPlugin):
                 return classes[label] if label < len(classes) else 0
             df['class_id'] = df['label'].apply(get_class)
 
+        df["intensity_channel_name"] = channel_name
         return df
+
+
+def _parse_intensity_channel(value) -> int:
+    if value is None:
+        return -1
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("all", ""):
+            return -1
+        if v in ("1", "2", "3"):
+            return int(v) - 1
+        try:
+            return int(v)
+        except ValueError as exc:
+            raise ValueError(f"Invalid intensity_channel value: {value}") from exc
+    try:
+        return int(value)
+    except Exception as exc:
+        raise ValueError(f"Invalid intensity_channel value: {value}") from exc
+
+
+def _format_intensity_channel_name(channel_index: int) -> str:
+    if channel_index < 0:
+        return "all"
+    return f"ch{channel_index + 1}"

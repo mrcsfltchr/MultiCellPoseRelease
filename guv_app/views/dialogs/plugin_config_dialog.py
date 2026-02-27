@@ -1,7 +1,11 @@
+import logging
+
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QDialogButtonBox, 
                              QWidget, QGroupBox, QScrollArea, QLabel,
                              QFormLayout, QSpinBox, QDoubleSpinBox, 
                              QCheckBox, QLineEdit, QComboBox)
+
+_logger = logging.getLogger(__name__)
 
 class DynamicPluginConfigWidget(QWidget):
     """
@@ -89,7 +93,14 @@ class PluginConfigDialog(QDialog):
             
             group_layout = QVBoxLayout(group)
             
-            definitions = plugin.get_parameter_definitions()
+            definitions = self._get_plugin_definitions(plugin)
+            _logger.info(
+                "Plugin config UI: %s (%s.%s) definitions=%s",
+                name,
+                plugin.__class__.__module__,
+                plugin.__class__.__name__,
+                list(definitions.keys()) if isinstance(definitions, dict) else "<invalid>",
+            )
             if definitions:
                 widget = DynamicPluginConfigWidget(definitions)
                 group_layout.addWidget(widget)
@@ -108,6 +119,42 @@ class PluginConfigDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         self.layout.addWidget(buttons)
+
+    def _get_plugin_definitions(self, plugin):
+        try:
+            definitions = plugin.get_parameter_definitions()
+            if isinstance(definitions, dict):
+                if definitions:
+                    return definitions
+            else:
+                definitions = {}
+        except Exception:
+            definitions = {}
+
+        # Compatibility guard for legacy BasicStatsPlugin variants that may not
+        # override get_parameter_definitions correctly.
+        plugin_name = ""
+        try:
+            plugin_name = str(getattr(plugin, "name", "")).strip()
+        except Exception:
+            plugin_name = ""
+        if plugin.__class__.__name__ == "BasicStatsPlugin" or plugin_name in {"Basic Stats", "Basic Statistics"}:
+            return {
+                "intensity_channel": {
+                    "type": "enum",
+                    "default": "all",
+                    "options": ["all", "1", "2", "3"],
+                    "label": "Intensity Channel",
+                    "help": "'all' averages channels. 1/2/3 selects R/G/B channel.",
+                }
+            }
+        _logger.warning(
+            "Plugin '%s' (%s.%s) provided no parameter definitions.",
+            plugin_name or plugin.__class__.__name__,
+            plugin.__class__.__module__,
+            plugin.__class__.__name__,
+        )
+        return {}
 
     def get_configuration(self):
         """Returns (selected_plugins_list, plugin_params_dict)"""

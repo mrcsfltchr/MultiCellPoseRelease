@@ -5,6 +5,7 @@ import pkgutil
 import importlib
 import inspect
 import os
+import sys
 from typing import List, Dict
 from guv_app.plugins.interface import AnalysisPlugin
 import guv_app.plugins
@@ -19,11 +20,14 @@ class AnalysisService:
         self.plugins = {}
         self.discover_plugins()
 
-    def discover_plugins(self):
+    def discover_plugins(self, reload_modules: bool = False):
         """Automatically discovers and registers plugins from the plugins package."""
+        self.plugins = {}
         for _, name, _ in pkgutil.iter_modules(guv_app.plugins.__path__, guv_app.plugins.__name__ + "."):
             try:
                 module = importlib.import_module(name)
+                if reload_modules and name in sys.modules:
+                    module = importlib.reload(module)
                 for _, obj in inspect.getmembers(module):
                     if inspect.isclass(obj) and issubclass(obj, AnalysisPlugin):
                         if not inspect.isabstract(obj):
@@ -36,8 +40,35 @@ class AnalysisService:
 
     def register_plugin(self, plugin: AnalysisPlugin):
         """Registers a new analysis plugin."""
-        self.plugins[plugin.name] = plugin
-        _logger.info(f"Registered analysis plugin: {plugin.name}")
+        name = plugin.name
+        existing = self.plugins.get(name)
+        if existing is not None:
+            existing_params = _safe_param_count(existing)
+            new_params = _safe_param_count(plugin)
+            if existing_params > 0 and new_params == 0:
+                _logger.warning(
+                    "Skipping duplicate plugin '%s' from %s.%s because existing plugin has parameter definitions.",
+                    name,
+                    plugin.__class__.__module__,
+                    plugin.__class__.__name__,
+                )
+                return
+            _logger.warning(
+                "Replacing plugin '%s' (%s.%s) with %s.%s",
+                name,
+                existing.__class__.__module__,
+                existing.__class__.__name__,
+                plugin.__class__.__module__,
+                plugin.__class__.__name__,
+            )
+        self.plugins[name] = plugin
+        _logger.info(
+            "Registered analysis plugin: %s (%s.%s, params=%d)",
+            name,
+            plugin.__class__.__module__,
+            plugin.__class__.__name__,
+            _safe_param_count(plugin),
+        )
 
     def get_available_plugins(self) -> List[str]:
         return list(self.plugins.keys())
@@ -119,7 +150,8 @@ class AnalysisService:
             if df is not None and not df.empty:
                 # Sanitize plugin name for filename
                 safe_name = "".join(x for x in plugin_name if x.isalnum() or x in "._- ").replace(" ", "_")
-                csv_path = f"{base}_{safe_name}.csv"
+                suffix = _csv_suffix_from_df(df)
+                csv_path = f"{base}_{safe_name}{suffix}.csv"
                 try:
                     df.to_csv(csv_path, index=False)
                     saved_files.append(csv_path)
@@ -127,3 +159,24 @@ class AnalysisService:
                 except Exception as e:
                     _logger.error(f"Failed to save CSV {csv_path}: {e}")
         return saved_files
+
+
+def _safe_param_count(plugin: AnalysisPlugin) -> int:
+    try:
+        defs = plugin.get_parameter_definitions()
+    except Exception:
+        return 0
+    if not isinstance(defs, dict):
+        return 0
+    return len(defs)
+
+
+def _csv_suffix_from_df(df: pd.DataFrame) -> str:
+    if "intensity_channel_name" not in df.columns:
+        return ""
+    values = [str(v).strip() for v in df["intensity_channel_name"].dropna().unique() if str(v).strip()]
+    if len(values) == 1:
+        val = "".join(c for c in values[0] if c.isalnum() or c in "._-").lower()
+        if val:
+            return f"_{val}"
+    return "_multi_channel"

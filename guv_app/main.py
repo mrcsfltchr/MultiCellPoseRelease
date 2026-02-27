@@ -2,6 +2,7 @@ import sys
 import logging
 import os
 import argparse
+import inspect
 from pathlib import Path
 try:
     from PyQt6.QtWidgets import QApplication
@@ -44,6 +45,32 @@ def _set_windows_app_id(app_id: str) -> None:
         pass
 
 
+def _log_runtime_module_paths() -> None:
+    logger = logging.getLogger(__name__)
+    logger.info("Python executable: %s", sys.executable)
+    logger.info("Working directory: %s", os.getcwd())
+    try:
+        import guv_app
+        from guv_app.services import analysis_service
+        from guv_app.views.dialogs import plugin_config_dialog
+        from guv_app.plugins import basic_stats
+        logger.info("Loaded guv_app from: %s", getattr(guv_app, "__file__", "<unknown>"))
+        logger.info(
+            "Loaded analysis_service from: %s",
+            inspect.getsourcefile(analysis_service) or "<unknown>",
+        )
+        logger.info(
+            "Loaded plugin_config_dialog from: %s",
+            inspect.getsourcefile(plugin_config_dialog) or "<unknown>",
+        )
+        logger.info(
+            "Loaded basic_stats plugin from: %s",
+            inspect.getsourcefile(basic_stats) or "<unknown>",
+        )
+    except Exception as exc:
+        logger.warning("Could not log runtime module paths: %s", exc)
+
+
 def main():
     """
     Main function to initialize and run the GUVpose application.
@@ -54,6 +81,7 @@ def main():
         format='%(asctime)s - %(levelname)s - %(message)s',
         stream=sys.stdout  # Log to standard output
     )
+    _log_runtime_module_paths()
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--train-debug", action="store_true", default=False)

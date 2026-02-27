@@ -463,6 +463,21 @@ def imread(filename, return_first_tile=True, save_tiles=True):
             dat = np.load(filename, allow_pickle=True).item()
             masks = dat["masks"]
             return masks
+        except ModuleNotFoundError as e:
+            if "numpy._core" in str(e):
+                import numpy.core as _np_core
+                sys.modules.setdefault("numpy._core", _np_core)
+                sys.modules.setdefault("numpy._core.multiarray", _np_core.multiarray)
+                sys.modules.setdefault("numpy._core.numeric", _np_core.numeric)
+                try:
+                    dat = np.load(filename, allow_pickle=True).item()
+                    masks = dat["masks"]
+                    return masks
+                except Exception as e2:
+                    io_logger.critical("ERROR: could not read masks from file, %s" % e2)
+                    return None
+            io_logger.critical("ERROR: could not read masks from file, %s" % e)
+            return None
         except Exception as e:
             io_logger.critical("ERROR: could not read masks from file, %s" % e)
             return None
@@ -1912,3 +1927,6 @@ def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[
                (flows[0] * (2**16 - 1)).astype(np.uint16))
         #save full flow data
         imsave(os.path.join(flowdir, basename + '_dP' + suffix + '.tif'), flows[1])
+
+
+

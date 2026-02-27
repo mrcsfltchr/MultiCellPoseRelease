@@ -122,7 +122,7 @@ class AnalyzerController(MainController):
         if self.analysis_service is None:
             self.analysis_service = AnalysisService()
         else:
-            self.analysis_service.discover_plugins()
+            self.analysis_service.discover_plugins(reload_modules=True)
 
         if not self.analysis_service.plugins:
             self.view.show_progress("No analysis plugins available.")
@@ -295,6 +295,8 @@ class AnalyzerController(MainController):
         # Ensure service is ready
         if self.analysis_service is None:
             self.analysis_service = AnalysisService()
+        else:
+            self.analysis_service.discover_plugins(reload_modules=True)
 
         # 1. Select Plugin
         selected_plugins, plugin_params = self.view.prompt_plugin_configuration(self.analysis_service.plugins)
@@ -364,6 +366,8 @@ class AnalyzerController(MainController):
             return
         if self.analysis_service is None:
             self.analysis_service = AnalysisService()
+        else:
+            self.analysis_service.discover_plugins(reload_modules=True)
         selected_plugins, plugin_params = self.view.prompt_plugin_configuration(
             self.analysis_service.plugins
         )
@@ -491,7 +495,19 @@ class AnalyzerController(MainController):
                     except Exception:
                         pass
                     series_suffix = f"__{series_key}{series_index}"
-                out_path = f"{os.path.splitext(base_file)[0]}__series{series_suffix}_{safe_name}.csv"
+                channel_suffix = ""
+                if "intensity_channel_name" in merged.columns:
+                    vals = [
+                        str(v).strip() for v in merged["intensity_channel_name"].dropna().unique()
+                        if str(v).strip()
+                    ]
+                    if len(vals) == 1:
+                        token = "".join(c for c in vals[0] if c.isalnum() or c in "._-").lower()
+                        if token:
+                            channel_suffix = f"_{token}"
+                    elif len(vals) > 1:
+                        channel_suffix = "_multi_channel"
+                out_path = f"{os.path.splitext(base_file)[0]}__series{series_suffix}_{safe_name}{channel_suffix}.csv"
                 try:
                     merged.to_csv(out_path, index=False)
                     self.view.show_progress(f"Saved {os.path.basename(out_path)}")

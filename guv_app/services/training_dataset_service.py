@@ -2,6 +2,7 @@ import os
 import random
 import logging
 import glob
+import sys
 
 import numpy as np
 from cellpose import io as cellpose_io
@@ -12,6 +13,20 @@ from cellpose.semantic_label_utils import (
 
 _logger = logging.getLogger(__name__)
 
+
+def _load_seg_npy_compat(seg_path):
+    try:
+        return np.load(seg_path, allow_pickle=True).item()
+    except ModuleNotFoundError as exc:
+        # Compatibility for seg/pred files pickled under NumPy 2.x (`numpy._core`)
+        # and later loaded in environments where only `numpy.core` exists.
+        if "numpy._core" not in str(exc):
+            raise
+        import numpy.core as _np_core
+        sys.modules.setdefault("numpy._core", _np_core)
+        sys.modules.setdefault("numpy._core.multiarray", _np_core.multiarray)
+        sys.modules.setdefault("numpy._core.numeric", _np_core.numeric)
+        return np.load(seg_path, allow_pickle=True).item()
 
 class TrainingDatasetService:
     def _sanitize_class_map(self, class_map, masks=None, classes=None, class_names=None):
@@ -77,7 +92,7 @@ class TrainingDatasetService:
         if not os.path.exists(seg_path):
             return False, ["missing seg file"], None
         try:
-            dat = np.load(seg_path, allow_pickle=True).item()
+            dat = _load_seg_npy_compat(seg_path)
         except Exception as exc:
             return False, [f"failed to read seg file: {exc}"], None
         masks = dat.get("masks")
@@ -160,7 +175,7 @@ class TrainingDatasetService:
                         image_ref = base_filename
                     invalid.append((image_ref, seg_path_item, issues))
                     continue
-                dat = np.load(seg_path_item, allow_pickle=True).item()
+                dat = _load_seg_npy_compat(seg_path_item)
                 masks = np.squeeze(dat.get("masks"))
                 if seg_frame_id:
                     frame = cellpose_io.read_image_frame(base_filename, seg_frame_id)
@@ -187,3 +202,5 @@ class TrainingDatasetService:
                 train_labels.append(masks)
                 class_maps.append(class_map)
         return train_data, train_labels, train_files, class_maps, invalid
+
+
