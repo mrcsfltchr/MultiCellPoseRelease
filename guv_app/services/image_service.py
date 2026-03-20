@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import numpy as np
+import tifffile
 from cellpose import io, transforms
 try:
     import nd2 as nd2_lib
@@ -21,6 +22,7 @@ class ImageService:
         self._nd2_dask_cache = {}
         self._nd2_meta_cache = {}
         self._frame_cache = {}
+        self._stack_axis_overrides = {}
         self._save_lock = threading.Lock()
         self._save_cv = threading.Condition(self._save_lock)
         self._pending_saves = {}
@@ -41,6 +43,149 @@ class ImageService:
         self._frame_cache.clear()
         self._frame_cache[filename] = frames
 
+    def _normalize_path_key(self, filename):
+        return os.path.normcase(os.path.normpath(filename))
+
+    def get_stack_axis_override(self, filename):
+        return self._stack_axis_overrides.get(self._normalize_path_key(filename))
+
+    def set_stack_axis_override(self, filename, interpretation):
+        key = self._normalize_path_key(filename)
+        if interpretation in ("channels", "positions"):
+            self._stack_axis_overrides[key] = interpretation
+        else:
+            self._stack_axis_overrides.pop(key, None)
+
+    def inspect_tiff_stack_ambiguity(self, filename):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".tif", ".tiff"):
+            return None
+        try:
+            with tifffile.TiffFile(filename) as tif:
+                series = tif.series[0]
+                shape = tuple(getattr(series, "shape", ()))
+                axes = getattr(series, "axes", None)
+                imagej_meta = getattr(tif, "imagej_metadata", None)
+                ome_xml = getattr(tif, "ome_metadata", None)
+        except Exception as e:
+            _logger.warning(f"Could not inspect TIFF metadata for {filename}: {e}")
+            return None
+
+        _logger.info(
+            "TIFF inspection: file=%s axes=%s shape=%s imagej_keys=%s ome=%s",
+            filename,
+            axes,
+            shape,
+            sorted(imagej_meta.keys()) if isinstance(imagej_meta, dict) else None,
+            bool(isinstance(ome_xml, str) and ome_xml),
+        )
+
+        first_axis = axes[0] if isinstance(axes, str) and len(axes) == 3 else None
+        ambiguous_first_axis = first_axis in (None, "Z", "Q", "I")
+        if len(shape) == 3 and int(shape[0]) <= 8 and int(shape[1]) > 8 and int(shape[2]) > 8:
+            if axes is None or ambiguous_first_axis:
+                imagej_channels = imagej_slices = imagej_frames = 1
+                if isinstance(imagej_meta, dict):
+                    imagej_channels = int(imagej_meta.get("channels", 1) or 1)
+                    imagej_slices = int(imagej_meta.get("slices", 1) or 1)
+                    imagej_frames = int(imagej_meta.get("frames", 1) or 1)
+                    if imagej_channels > 1 and imagej_slices <= 1 and imagej_frames <= 1 and int(shape[0]) == imagej_channels:
+                        return None
+
+                if isinstance(ome_xml, str):
+                    size_c = size_z = size_t = 1
+                    try:
+                        import re
+                        m = re.search(r'SizeC="(\d+)"', ome_xml)
+                        if m:
+                            size_c = int(m.group(1))
+                        m = re.search(r'SizeZ="(\d+)"', ome_xml)
+                        if m:
+                            size_z = int(m.group(1))
+                        m = re.search(r'SizeT="(\d+)"', ome_xml)
+                        if m:
+                            size_t = int(m.group(1))
+                    except Exception:
+                        pass
+                    if size_c > 1 and size_z <= 1 and size_t <= 1 and int(shape[0]) == size_c:
+                        return None
+                    if size_z > 1 and size_c <= 1 and size_t <= 1 and int(shape[0]) == size_z:
+                        return None
+
+                _logger.info(
+                    "TIFF ambiguity detected: file=%s axes=%s shape=%s",
+                    filename,
+                    axes,
+                    shape,
+                )
+                return {
+                    "planes": int(shape[0]),
+                    "axes": axes,
+                    "shape": shape,
+                }
+        return None
+
+    def _apply_stack_axis_override(self, filename, arr, meta=None):
+        interpretation = self.get_stack_axis_override(filename)
+        if interpretation not in ("channels", "positions"):
+            return arr, meta
+
+        arr = np.asarray(arr)
+        if arr.ndim != 3 or int(arr.shape[0]) > 8 or int(arr.shape[1]) <= 8 or int(arr.shape[2]) <= 8:
+            return arr, meta
+
+        if interpretation == "channels":
+            arr = np.moveaxis(arr, 0, -1)
+            axes = "YXC"
+        else:
+            axes = "PYX"
+
+        meta_out = io.ImageMeta(
+            axes=axes,
+            shape=tuple(arr.shape),
+            sizes=self._sizes_from_axes(axes, tuple(arr.shape)),
+            dtype=arr.dtype,
+        )
+        return arr, meta_out
+
+    def _prepare_image_array(self, arr, meta=None):
+        """Reduce multi-axis arrays to GUI-friendly YX or YXC and keep channels-last."""
+        if arr is None:
+            return None
+        arr = np.asarray(arr)
+        if arr.ndim < 2:
+            return arr
+
+        axes = getattr(meta, "axes", None) if meta is not None else None
+        axes = axes if isinstance(axes, str) and len(axes) == arr.ndim else None
+
+        # For display we only need one slice from series/time/depth-like axes.
+        if axes:
+            for axis_name in ("S", "P", "T", "Z"):
+                while axis_name in axes:
+                    idx = axes.index(axis_name)
+                    arr = np.take(arr, 0, axis=idx)
+                    axes = axes[:idx] + axes[idx + 1:]
+            if "C" in axes:
+                c_idx = axes.index("C")
+                if c_idx != arr.ndim - 1:
+                    arr = np.moveaxis(arr, c_idx, -1)
+                    axes = axes.replace("C", "") + "C"
+
+        arr = np.squeeze(arr)
+        while arr.ndim > 3:
+            arr = np.take(arr, 0, axis=0)
+            arr = np.squeeze(arr)
+        arr = self._normalize_channels_last(arr)
+
+        _logger.info(
+            "Prepared image array: axes=%s shape=%s dtype=%s",
+            getattr(meta, "axes", None) if meta is not None else None,
+            tuple(arr.shape),
+            getattr(arr, "dtype", None),
+        )
+        return arr
+
     def load_image(self, filename, do_3D=False):
         """
         Loads an image using cellpose.io.imread.
@@ -48,7 +193,8 @@ class ImageService:
         _logger.info(f"Loading image: {filename}")
         try:
             data = io.read_image_data(filename)
-            image = data.array
+            arr, meta = self._apply_stack_axis_override(filename, data.array, getattr(data, "meta", None))
+            image = self._prepare_image_array(arr, meta)
 
             if image is None:
                 _logger.error(f"Failed to load image: {filename}")
@@ -123,13 +269,30 @@ class ImageService:
     def load_frame(self, filename, frame_id):
         if frame_id is None:
             return self.load_image(filename)
+        if self.get_stack_axis_override(filename) == "positions":
+            data = io.read_image_data(filename)
+            arr, meta = self._apply_stack_axis_override(filename, data.array, getattr(data, "meta", None))
+            axes = getattr(meta, "axes", None) if meta is not None else None
+            if axes and "P" in axes:
+                index = self._parse_frame_id(frame_id).get("P", 0)
+                p_idx = axes.index("P")
+                frame_arr = np.take(arr, index, axis=p_idx)
+                frame_axes = axes[:p_idx] + axes[p_idx + 1:]
+                frame_meta = io.ImageMeta(
+                    axes=frame_axes,
+                    shape=tuple(frame_arr.shape),
+                    sizes=self._sizes_from_axes(frame_axes, tuple(frame_arr.shape)),
+                    dtype=frame_arr.dtype,
+                )
+                return self._prepare_image_array(frame_arr, frame_meta)
         frame = io.read_image_frame(filename, frame_id)
         if frame is not None:
-            return frame.array
+            arr, meta = self._apply_stack_axis_override(filename, frame.array, getattr(frame, "meta", None))
+            return self._prepare_image_array(arr, meta)
         frames = self.iter_image_frames(filename, frame_id=frame_id)
         for frame in frames:
             if frame.frame_id == frame_id:
-                return frame.array
+                return self._prepare_image_array(frame.array, getattr(frame, "meta", None))
         _logger.error(f"Frame {frame_id} not found for {filename}")
         return None
 
@@ -224,6 +387,15 @@ class ImageService:
         return self._parse_frame_id(frame_id)
 
     def get_series_time_info(self, filename):
+        override = self.get_stack_axis_override(filename)
+        if override == "positions":
+            info = self.inspect_tiff_stack_ambiguity(filename)
+            if info is not None:
+                return "P", int(info["planes"]), 1
+        if override == "channels":
+            info = self.inspect_tiff_stack_ambiguity(filename)
+            if info is not None:
+                return None, 1, 1
         try:
             return io.get_series_time_info(filename)
         except Exception as e:
@@ -255,6 +427,32 @@ class ImageService:
         Iterates over frames in a file, returning a list of ImageFrame objects.
         """
         _logger.info(f"Loading image frames: {filename}")
+        if self.get_stack_axis_override(filename) == "positions":
+            try:
+                data = io.read_image_data(filename)
+                arr, meta = self._apply_stack_axis_override(filename, data.array, getattr(data, "meta", None))
+                axes = getattr(meta, "axes", None) if meta is not None else None
+                if axes and "P" in axes:
+                    p_idx = axes.index("P")
+                    frames = []
+                    parsed = self._parse_frame_id(frame_id) if frame_id else {}
+                    only_index = parsed.get("P")
+                    for p_index in range(arr.shape[p_idx]):
+                        if only_index is not None and p_index != only_index:
+                            continue
+                        frame_arr = np.take(arr, p_index, axis=p_idx)
+                        frame_axes = axes[:p_idx] + axes[p_idx + 1:]
+                        frame_meta = io.ImageMeta(
+                            axes=frame_axes,
+                            shape=tuple(frame_arr.shape),
+                            sizes=self._sizes_from_axes(frame_axes, tuple(frame_arr.shape)),
+                            dtype=frame_arr.dtype,
+                            series_index=p_index,
+                        )
+                        frames.append(io.ImageFrame(frame_arr, frame_meta, f"P{p_index}"))
+                    return frames
+            except Exception as e:
+                _logger.error(f"Error loading overridden TIFF frames {filename}: {e}")
         ext = os.path.splitext(filename)[1].lower()
         if ext == ".nd2" and nd2_lib is not None:
             frames = self._iter_nd2_frames_lazy(filename, series_index=series_index, frame_id=frame_id)
@@ -385,6 +583,21 @@ class ImageService:
                         if inferred:
                             axes = inferred
                             self._nd2_meta_cache[filename] = {"axes": axes, "sizes": sizes}
+                    # nd2 library may report axes for a single frame (e.g. "CYX") while
+                    # to_dask() prepends the series/position dimension. Detect this by
+                    # comparing dask ndim vs axes length when series_axis is missing.
+                    if (axes is not None and series_key and series_count > 1
+                            and series_axis is None
+                            and dask_arr.ndim == len(axes) + 1
+                            and dask_arr.shape[0] == series_count):
+                        axes = series_key + axes
+                        series_axis = 0
+                        self._nd2_meta_cache[filename] = {"axes": axes, "sizes": sizes}
+                    # series_axis may still be None if axes were inferred after it was
+                    # computed (e.g. _infer_axes_from_sizes already included the series
+                    # key so the +1 correction above didn't fire).  Resolve it now.
+                    if series_axis is None and axes and series_key and series_key in axes:
+                        series_axis = axes.index(series_key)
 
                 frames = []
                 def _compute_slice(indexer):
@@ -429,8 +642,12 @@ class ImageService:
                                         frame_id_out = f"{series_key}{s_idx}_T{t_idx}"
                                     else:
                                         frame_id_out = f"{series_key}{s_idx}"
+                                elif time_count > 1:
+                                    frame_id_out = f"T{t_idx}"
+                                elif z_count > 1:
+                                    frame_id_out = f"Z{z_index}"
                                 else:
-                                    frame_id_out = f"T{t_idx}" if time_count > 1 else None
+                                    frame_id_out = None
                                 meta = io.ImageMeta(
                                     axes="".join(out_axes) if out_axes else None,
                                     shape=tuple(arr.shape),
@@ -481,8 +698,12 @@ class ImageService:
                                     frame_id_out = f"{series_key}{s_idx}_T{t_idx}"
                                 else:
                                     frame_id_out = f"{series_key}{s_idx}"
+                            elif time_count > 1:
+                                frame_id_out = f"T{t_idx}"
+                            elif z_count > 1:
+                                frame_id_out = f"Z{z_index}"
                             else:
-                                frame_id_out = f"T{t_idx}" if time_count > 1 else None
+                                frame_id_out = None
                             meta = io.ImageMeta(
                                 axes="YXC" if arr.ndim == 3 else "YX",
                                 shape=tuple(arr.shape),
@@ -722,6 +943,8 @@ class ImageService:
         return copied
 
     def _build_common_payload(self, model):
+        if hasattr(model, "persist_current_channel_state"):
+            model.persist_current_channel_state()
         masks = np.array(model.masks, copy=True)
         nmask = int(masks.max()) if masks is not None else 0
         classes = getattr(model, "mask_classes", None)
@@ -744,6 +967,10 @@ class ImageService:
             "class_names": self._safe_list_copy(getattr(model, "class_names", None)),
             "class_colors": self._safe_list_copy(getattr(model, "class_colors", None)),
             "diameter": getattr(model, "diameter", None),
+            "object_ids": np.array(model.get_object_ids_for_channel(), copy=True) if hasattr(model, "get_object_ids_for_channel") else np.zeros(nmask + 1, dtype=np.int32),
+            "channel_segmentations": model.export_channel_segmentations() if hasattr(model, "export_channel_segmentations") else None,
+            "associations": model.export_associations() if hasattr(model, "export_associations") else None,
+            "active_channel_index": int(model.get_current_channel_index()) if hasattr(model, "get_current_channel_index") else 0,
         }
 
     def _build_seg_payload(self, model):
@@ -814,6 +1041,10 @@ class ImageService:
         dat["classes_map"] = classes_map
         dat["class_names"] = payload.get("class_names")
         dat["class_colors"] = payload.get("class_colors")
+        dat["object_ids"] = payload.get("object_ids")
+        dat["channel_segmentations"] = payload.get("channel_segmentations")
+        dat["associations"] = payload.get("associations")
+        dat["active_channel_index"] = int(payload.get("active_channel_index", 0))
         self._write_npy_atomic(save_path, dat)
         _logger.info(f"Saved {save_path}")
 
@@ -831,6 +1062,10 @@ class ImageService:
             "class_names": payload.get("class_names"),
             "class_colors": payload.get("class_colors"),
             "diameter": payload.get("diameter"),
+            "object_ids": payload.get("object_ids"),
+            "channel_segmentations": payload.get("channel_segmentations"),
+            "associations": payload.get("associations"),
+            "active_channel_index": int(payload.get("active_channel_index", 0)),
         }
         try:
             from cellpose import utils

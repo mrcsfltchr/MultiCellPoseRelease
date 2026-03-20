@@ -111,6 +111,8 @@ class MainController(QObject):
         self.view.control_panel.visualization_checkbox.stateChanged.connect(self.handle_toggle_visualization)
         self.view.control_panel.class_visibility_changed.connect(self.handle_class_visibility)
         self.view.drawing_item.assign_class_requested.connect(self.handle_assign_class)
+        self.view.drawing_item.select_mask_requested.connect(self.handle_select_mask)
+        self.view.drawing_item.select_reference_mask_requested.connect(self.handle_select_reference_mask)
         self.view.drawing_item.selection_rect_finished.connect(self.handle_select_masks_in_rect)
         self.view.drawing_item.clear_selection_requested.connect(self.handle_clear_selected_masks)
         self.view.drawing_item.delete_mask_requested.connect(self.handle_delete_mask)
@@ -248,6 +250,15 @@ class MainController(QObject):
         base, frame_id = self.image_service.split_image_reference(filename)
         series_index = None
         if frame_id is None:
+            ambiguity = self.image_service.inspect_tiff_stack_ambiguity(base)
+            if ambiguity is not None and self.image_service.get_stack_axis_override(base) is None:
+                interpretation = self.view.prompt_tiff_stack_interpretation(
+                    base,
+                    ambiguity["planes"],
+                )
+                if interpretation is None:
+                    return
+                self.image_service.set_stack_axis_override(base, interpretation)
             series_key, series_count, time_count = self.image_service.get_series_time_info(base)
             if series_count > 1 and time_count > 1:
                 label = series_key or "series"
@@ -1582,6 +1593,28 @@ class MainController(QObject):
             f"Linked channel {reference_channel + 1} mask {reference_mask_id} "
             f"to channel {current_channel + 1} mask {selected_ids[0]}. Green line updated."
         )
+
+    def handle_select_mask(self, y, x):
+        if self.model.cellpix is None:
+            return
+        if 0 <= y < self.model.Ly and 0 <= x < self.model.Lx:
+            mask_id = int(self.model.cellpix[0, y, x])
+            if mask_id > 0:
+                self.model.selected_mask_ids = {mask_id}
+                self.view.statusBar().showMessage(f"Selected mask {mask_id}.")
+            else:
+                self.model.clear_selected_masks()
+                self.model.clear_reference_selection()
+        self.model.trigger_view_update()
+
+    def handle_select_reference_mask(self, y, x):
+        mask_id = self.model.select_reference_mask_at_point(y, x)
+        if mask_id > 0:
+            ref_idx = self.model.previous_channel_index
+            self.view.statusBar().showMessage(f"Selected reference mask {mask_id} from channel {ref_idx + 1}.")
+        else:
+            self.view.statusBar().showMessage("No previous-channel mask at that location.")
+        self.model.trigger_view_update()
 
     def handle_class_visibility(self, class_index, is_visible):
         """Handles toggling the visibility of a specific class."""

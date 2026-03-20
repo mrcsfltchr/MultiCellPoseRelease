@@ -13,15 +13,17 @@ class DrawingItem(pg.ImageItem):
     delete_stroke_finished = QtCore.pyqtSignal(object)
     selection_rect_finished = QtCore.pyqtSignal(object)
     clear_selection_requested = QtCore.pyqtSignal()
+    select_mask_requested = QtCore.pyqtSignal(int, int)
+    select_reference_mask_requested = QtCore.pyqtSignal(int, int)
 
     def __init__(self, parent=None):
         # FIX: Do NOT pass 'parent' (QMainWindow) to QGraphicsObject constructor.
         super().__init__()
-        self.parent_view = parent 
-        
+        self.parent_view = parent
+
         # Enable mouse interaction
         self.setAcceptHoverEvents(True)
-        
+
         # State for drawing
         self.current_stroke = []
         self.in_stroke = False
@@ -33,6 +35,7 @@ class DrawingItem(pg.ImageItem):
         self._select_start = None
         self._selecting = False
         self._selection_rect = None
+        self.association_mode = False
 
     def mouseClickEvent(self, ev):
         ev.accept() # Prevent ViewBox menu from opening on right-click
@@ -50,14 +53,15 @@ class DrawingItem(pg.ImageItem):
             pos = ev.pos()
             y, x = int(pos.y()), int(pos.x())
             
-            # Handle modifier keys for actions defined in MainController
             if not self.in_stroke:
                 if ev.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
-                     self.delete_mask_requested.emit(y, x)
+                    self.delete_mask_requested.emit(y, x)
+                elif ev.modifiers() & QtCore.Qt.KeyboardModifier.AltModifier and self.association_mode:
+                    self.select_reference_mask_requested.emit(y, x)
                 elif ev.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
-                     self.assign_class_requested.emit(y, x)
+                    self.assign_class_requested.emit(y, x)
                 else:
-                     self.clear_selection_requested.emit()
+                    self.select_mask_requested.emit(y, x)
 
     def mouseDragEvent(self, ev):
         ev.accept()
