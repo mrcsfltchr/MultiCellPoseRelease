@@ -1,4 +1,5 @@
 import os
+import logging
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -25,6 +26,9 @@ from cellpose import utils
 from guv_app.views.widgets.drawing import DrawingItem
 from guv_app.views.widgets.control_panel import ControlPanel
 
+_logger = logging.getLogger(__name__)
+
+
 class BaseMainView(QMainWindow):
     """
     The main application window containing all shared UI components.
@@ -35,6 +39,7 @@ class BaseMainView(QMainWindow):
     save_requested = pyqtSignal()
     navigate_next_requested = pyqtSignal()
     navigate_prev_requested = pyqtSignal()
+    navigate_z_requested = pyqtSignal(int)
     connect_remote_requested = pyqtSignal()
     disconnect_remote_requested = pyqtSignal()
     add_ssh_hostname_requested = pyqtSignal()
@@ -47,15 +52,21 @@ class BaseMainView(QMainWindow):
     model_train_help_requested = pyqtSignal()
     export_csv_requested = pyqtSignal()
     promote_requested = pyqtSignal()
+    import_seg_requested = pyqtSignal(str)
     toggle_masks_requested = pyqtSignal()
     toggle_outlines_requested = pyqtSignal()
+    toggle_freeze_masks_requested = pyqtSignal()
     toggle_color_mode_requested = pyqtSignal()
     toggle_visualization_requested = pyqtSignal()
+    move_selected_masks_requested = pyqtSignal(int, int)
     brush_size_change_requested = pyqtSignal(int)
     view_mode_step_requested = pyqtSignal(int)
     color_mode_step_requested = pyqtSignal(int)
     color_mode_set_requested = pyqtSignal(int)
     finalize_stroke_requested = pyqtSignal()
+    toggle_association_mode_requested = pyqtSignal(bool)
+    auto_associate_requested = pyqtSignal()
+    link_association_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,28 +88,47 @@ class BaseMainView(QMainWindow):
             ".flex",
         }
         self.setAcceptDrops(True)
-        
+
         # Central Widget & Layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
-        
+
         # 1. Image View (PyQtGraph)
         self.graph_layout = pg.GraphicsLayoutWidget()
         self.view_box = self.graph_layout.addViewBox(row=0, col=0)
         self.view_box.setAspectLocked(True)
         self.view_box.invertY(True)
-        
+
         # Image Item
         self.img_item = pg.ImageItem()
         self.view_box.addItem(self.img_item)
-        
+
         # Drawing Item (Masks)
         self.drawing_item = DrawingItem(parent=self)
         self.view_box.addItem(self.drawing_item)
-        
+
+        self.association_lines_item = pg.PlotDataItem()
+        self.association_lines_item.setPen(pg.mkPen((0, 255, 0), width=2))
+        self.view_box.addItem(self.association_lines_item)
+        self.association_selected_lines_item = pg.PlotDataItem()
+        self.association_selected_lines_item.setPen(pg.mkPen((0, 255, 255), width=3))
+        self.view_box.addItem(self.association_selected_lines_item)
+        self.association_points_item = pg.ScatterPlotItem(size=6, pxMode=True, pen=None, brush=pg.mkBrush(0, 255, 0, 220))
+        self.view_box.addItem(self.association_points_item)
+        self.association_selected_points_item = pg.ScatterPlotItem(size=8, pxMode=True, pen=None, brush=pg.mkBrush(0, 255, 255, 240))
+        self.view_box.addItem(self.association_selected_points_item)
+        self.reference_selection_points_item = pg.ScatterPlotItem(
+            size=14,
+            pxMode=True,
+            symbol="x",
+            pen=pg.mkPen((0, 255, 255), width=3),
+            brush=None,
+        )
+        self.view_box.addItem(self.reference_selection_points_item)
+
         self.main_layout.addWidget(self.graph_layout, stretch=3)
-        
+
         # 2. Control Panel
         self.control_panel = ControlPanel(parent=self)
         self.control_panel.run_folder_button.clicked.connect(self.on_run_on_folder)
@@ -127,7 +157,7 @@ class BaseMainView(QMainWindow):
 
             QProgressBar::chunk {
                 background-color: #3B82F6;
-                width: 10px; 
+                width: 10px;
             }
         """)
 
@@ -198,27 +228,46 @@ class BaseMainView(QMainWindow):
 
     def create_menu_bar(self):
         menubar = self.menuBar()
-        
+
         # File Menu
         file_menu = menubar.addMenu('&File')
-        
+
         load_action = QAction('&Load Image...', self)
         load_action.setShortcut('Ctrl+L')
         load_action.triggered.connect(self.on_load_image)
         file_menu.addAction(load_action)
-        
+
         save_action = QAction('&Save Masks', self)
         save_action.setShortcut('Ctrl+S')
         save_action.triggered.connect(self.save_requested.emit)
         file_menu.addAction(save_action)
 
+        import_seg_action = QAction('Import &Segmentation...', self)
+        import_seg_action.setShortcut('Ctrl+Shift+L')
+        import_seg_action.triggered.connect(self.on_import_segmentation)
+        file_menu.addAction(import_seg_action)
+
+        tools_menu = menubar.addMenu('&Tools')
+        self.association_mode_action = QAction('Association mode', self)
+        self.association_mode_action.setCheckable(True)
+        self.association_mode_action.toggled.connect(self.toggle_association_mode_requested.emit)
+        tools_menu.addAction(self.association_mode_action)
+
+        auto_associate_action = QAction('Auto-match current to previous channel', self)
+        auto_associate_action.triggered.connect(self.auto_associate_requested.emit)
+        tools_menu.addAction(auto_associate_action)
+
+        link_association_action = QAction('Link selected masks across channels', self)
+        link_association_action.triggered.connect(self.link_association_requested.emit)
+        tools_menu.addAction(link_association_action)
+
         # Remote Menu
         remote_menu = menubar.addMenu('&Remote')
-        
+
         self.remote_connect_action = QAction('&Connect to remote...', self)
         self.remote_connect_action.triggered.connect(self._handle_remote_action)
         remote_menu.addAction(self.remote_connect_action)
-        
+
         add_ssh_action = QAction('Add SSH Hostname...', self)
         add_ssh_action.triggered.connect(self.add_ssh_hostname_requested.emit)
         remote_menu.addAction(add_ssh_action)
@@ -226,13 +275,13 @@ class BaseMainView(QMainWindow):
         ssh_adv_action = QAction('SSH Advanced...', self)
         ssh_adv_action.triggered.connect(self.ssh_advanced_requested.emit)
         remote_menu.addAction(ssh_adv_action)
-        
+
         remote_menu.addSeparator()
 
         upload_action = QAction('&Upload model to server...', self)
         upload_action.triggered.connect(self.upload_model_requested.emit)
         remote_menu.addAction(upload_action)
-        
+
         clear_jobs_action = QAction('&Clear remote training files...', self)
         clear_jobs_action.triggered.connect(self.clear_remote_jobs_requested.emit)
         remote_menu.addAction(clear_jobs_action)
@@ -266,14 +315,18 @@ class BaseMainView(QMainWindow):
         self._shortcuts = []
         self._add_shortcut(QKeySequence("X"), self._toggle_masks_shortcut)
         self._add_shortcut(QKeySequence("Z"), self._toggle_outlines_shortcut)
+        self._add_shortcut(QKeySequence("F"), self._toggle_freeze_masks_shortcut)
         self._add_shortcut(QKeySequence("C"), self._toggle_color_mode_shortcut)
         self._add_shortcut(QKeySequence("K"), self._toggle_visualization_shortcut)
         self._add_shortcut(QKeySequence("D"), self._toggle_delete_lasso_shortcut)
         self._add_shortcut(QKeySequence(Qt.Key.Key_Left), self._navigate_prev_shortcut)
         self._add_shortcut(QKeySequence(Qt.Key.Key_Right), self._navigate_next_shortcut)
         self._add_shortcut(QKeySequence("A"), self._navigate_prev_shortcut)
-        self._add_shortcut(QKeySequence(","), lambda: self._brush_size_shortcut(-1))
-        self._add_shortcut(QKeySequence("."), lambda: self._brush_size_shortcut(1))
+        self._add_shortcut(QKeySequence(","), lambda: self._move_selected_masks_shortcut(-1, 0))
+        self._add_shortcut(QKeySequence("."), lambda: self._move_selected_masks_shortcut(1, 0))
+        self._add_shortcut(QKeySequence("J"), self._toggle_association_mode_shortcut)
+        self._add_shortcut(QKeySequence("M"), self._auto_associate_shortcut)
+        self._add_shortcut(QKeySequence("L"), self._link_association_shortcut)
         self._add_shortcut(QKeySequence("-"), lambda: self._zoom_view(1.1))
         self._add_shortcut(QKeySequence("="), lambda: self._zoom_view(0.9))
         self._add_shortcut(QKeySequence("+"), lambda: self._zoom_view(0.9))
@@ -286,6 +339,10 @@ class BaseMainView(QMainWindow):
         self._add_shortcut(QKeySequence("R"), lambda: self._color_mode_toggle(1))
         self._add_shortcut(QKeySequence("G"), lambda: self._color_mode_toggle(2))
         self._add_shortcut(QKeySequence("B"), lambda: self._color_mode_toggle(3))
+        self._add_shortcut(QKeySequence(Qt.Key.Key_BracketLeft), lambda: self._move_selected_masks_shortcut(0, -1))
+        self._add_shortcut(QKeySequence(Qt.Key.Key_BracketRight), lambda: self._move_selected_masks_shortcut(0, 1))
+        self._add_shortcut(QKeySequence("Q"), lambda: self._navigate_z_shortcut(-1))
+        self._add_shortcut(QKeySequence("E"), lambda: self._navigate_z_shortcut(1))
         self._add_shortcut(QKeySequence(Qt.Key.Key_Return), self._finalize_stroke_shortcut)
         self._add_shortcut(QKeySequence(Qt.Key.Key_Enter), self._finalize_stroke_shortcut)
 
@@ -311,6 +368,10 @@ class BaseMainView(QMainWindow):
         if not self._should_ignore_shortcut():
             self.toggle_outlines_requested.emit()
 
+    def _toggle_freeze_masks_shortcut(self):
+        if not self._should_ignore_shortcut():
+            self.toggle_freeze_masks_requested.emit()
+
     def _toggle_color_mode_shortcut(self):
         if not self._should_ignore_shortcut():
             self.toggle_color_mode_requested.emit()
@@ -326,6 +387,10 @@ class BaseMainView(QMainWindow):
     def _navigate_next_shortcut(self):
         if not self._should_ignore_shortcut():
             self.navigate_next_requested.emit()
+
+    def _navigate_z_shortcut(self, delta):
+        if not self._should_ignore_shortcut():
+            self.navigate_z_requested.emit(delta)
 
     def _brush_size_shortcut(self, delta):
         if not self._should_ignore_shortcut():
@@ -351,16 +416,47 @@ class BaseMainView(QMainWindow):
         if not self._should_ignore_shortcut(allow_in_stroke=True):
             self.finalize_stroke_requested.emit()
 
+    def _move_selected_masks_shortcut(self, dx, dy):
+        if not self._should_ignore_shortcut():
+            self.move_selected_masks_requested.emit(dx, dy)
+
     def _toggle_delete_lasso_shortcut(self):
         if self._should_ignore_shortcut():
             return
         if hasattr(self, "control_panel") and hasattr(self.control_panel, "delete_lasso_button"):
             self.control_panel.delete_lasso_button.toggle()
 
+    def _toggle_association_mode_shortcut(self):
+        if self._should_ignore_shortcut():
+            return
+        if hasattr(self, "association_mode_action"):
+            self.association_mode_action.trigger()
+
+    def _auto_associate_shortcut(self):
+        if not self._should_ignore_shortcut():
+            self.auto_associate_requested.emit()
+
+    def _link_association_shortcut(self):
+        if not self._should_ignore_shortcut():
+            self.link_association_requested.emit()
+
+    def set_association_mode_enabled(self, enabled):
+        if hasattr(self, "association_mode_action"):
+            self.association_mode_action.blockSignals(True)
+            self.association_mode_action.setChecked(bool(enabled))
+            self.association_mode_action.blockSignals(False)
+        if hasattr(self, "drawing_item"):
+            self.drawing_item.set_association_mode(enabled)
+
     def on_load_image(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.tif *.tiff *.png *.jpg *.jpeg *.npy *.nd2 *.lif *.dax *.nrrd)")
         if filename:
             self.file_loaded.emit(filename)
+
+    def on_import_segmentation(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Select segmentation", "", "Segmentation (*.npy)")
+        if filename:
+            self.import_seg_requested.emit(filename)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -408,6 +504,34 @@ class BaseMainView(QMainWindow):
         _, ext = os.path.splitext(path)
         return ext.lower() in self._supported_extensions
 
+    def prompt_tiff_stack_interpretation(self, filename, plane_count):
+        options = [
+            "Separate channels in one image",
+            "Separate positions/images",
+        ]
+        try:
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Interpret TIFF stack",
+                (
+                    f"The TIFF metadata does not define what the {plane_count} stacked planes mean.\n"
+                    f"File: {filename}\n"
+                    "Interpret the stack as:"
+                ),
+                options,
+                0,
+                False,
+            )
+            if not ok:
+                return None
+            if choice == options[0]:
+                return "channels"
+            if choice == options[1]:
+                return "positions"
+        except Exception:
+            return None
+        return None
+
     def prompt_series_index(self, max_series, message=None):
         if max_series <= 1:
             return 0
@@ -435,146 +559,220 @@ class BaseMainView(QMainWindow):
         self.model.view_update_signal.connect(self.update_view)
 
     def update_view(self):
-        # Refresh image/masks from model
         if self.model.image_data is not None:
             self.display_image(self.model.image_data)
-            
-        # Update DrawingItem with masks or empty RGBA buffer
-        if self.model.image_data is not None:
-            h, w = self.model.image_data.shape[:2]
-            
-            # Create RGBA buffer for masks/drawing
-            # For now, just a transparent layer. 
-            mask_display = np.zeros((h, w, 4), dtype=np.uint8)
-            
-            # Render masks if available (allow visualization even if cellpix is missing)
-            has_viz = self.model.visualization_masks is not None and self.model.view_config.show_visualization
-            if (self.model.cellpix is not None or has_viz) and (
-                self.model.view_config.masks_visible
-                or self.model.view_config.outlines_visible
-                or has_viz
-            ):
-                # Use current Z plane (assuming 0 for 2D for now)
-                z = 0 
-                if self.model.cellpix is None or z < self.model.cellpix.shape[0]:
-                    # 1. Select source array
+
+        if self.model.image_data is None:
+            self._clear_association_overlay()
+            return
+
+        h, w = self.model.image_data.shape[:2]
+        mask_display = np.zeros((h, w, 4), dtype=np.uint8)
+        z = 0
+
+        reference_idx = getattr(self.model, "previous_channel_index", None)
+        current_idx = self.model.get_current_channel_index() if hasattr(self.model, "get_current_channel_index") else 0
+        association_mode_enabled = bool(getattr(getattr(self, "association_mode_action", None), "isChecked", lambda: False)())
+        ref_state = None
+        ref_masks = None
+        selected_reference_mask_id = getattr(self.model, "selected_reference_mask_id", None)
+        if association_mode_enabled and reference_idx is not None and reference_idx != current_idx and hasattr(self.model, "channel_has_masks") and self.model.channel_has_masks(reference_idx):
+            ref_state = self.model.get_channel_state(reference_idx)
+            ref_masks = ref_state["masks"]
+            ref_masks = ref_masks[z] if ref_masks.ndim == 3 else ref_masks
+            ref_rgba = self._render_mask_layer(
+                ref_masks,
+                ref_state,
+                alpha_val=45,
+                force_color=np.array([255, 215, 0], dtype=np.uint8),
+                selected_ids={int(selected_reference_mask_id)} if selected_reference_mask_id else set(),
+                selection_color=np.array([0, 255, 255], dtype=np.uint8),
+            )
+            self._blit_rgba(mask_display, ref_rgba)
+
+        has_viz = self.model.visualization_masks is not None and self.model.view_config.show_visualization
+        if (self.model.cellpix is not None or has_viz) and (
+            self.model.view_config.masks_visible
+            or self.model.view_config.outlines_visible
+            or has_viz
+        ):
+            source_masks = None
+            is_outline_mode = False
+            if has_viz:
+                if self.model.visualization_masks.ndim == 3:
+                    if z < self.model.visualization_masks.shape[0]:
+                        source_masks = self.model.visualization_masks[z]
+                else:
+                    source_masks = self.model.visualization_masks
+            else:
+                if self.model.cellpix is not None:
+                    source_masks = self.model.cellpix[z]
+                if not self.model.view_config.masks_visible and self.model.view_config.outlines_visible:
+                    if self.model.outpix is not None:
+                        source_masks = self.model.outpix[z]
+                        is_outline_mode = True
+                elif not self.model.view_config.masks_visible:
                     source_masks = None
-                    is_outline_mode = False
-                    
-                    if has_viz:
-                        # Visualization takes precedence over standard masks/outlines
-                        if self.model.visualization_masks.ndim == 3:
-                             if z < self.model.visualization_masks.shape[0]:
-                                 source_masks = self.model.visualization_masks[z]
-                        else:
-                             source_masks = self.model.visualization_masks
-                    else:
-                        # Standard rendering logic
-                        if self.model.cellpix is not None:
-                            source_masks = self.model.cellpix[z]
-                        
-                        if not self.model.view_config.masks_visible and self.model.view_config.outlines_visible:
-                            if self.model.outpix is not None:
-                                source_masks = self.model.outpix[z]
-                                is_outline_mode = True
-                        elif not self.model.view_config.masks_visible:
-                            # Neither visible
-                            source_masks = None
 
-                    if source_masks is not None and source_masks.max() > 0:
-                        max_id = source_masks.max()
-                        
-                        # 2. Prepare Color Lookup Table (LUT)
-                        # LUT size: max_id + 1. Index 0 is background.
-                        color_lut = np.zeros((max_id + 1, 3), dtype=np.uint8)
-                        
-                        if self.model.view_config.color_by_class:
-                            # Map Mask ID -> Class ID -> Color
-                            mask_classes = self.model.mask_classes
-                            # Ensure mask_classes covers all mask IDs
-                            if len(mask_classes) <= max_id:
-                                mask_classes = np.pad(mask_classes, (0, max_id - len(mask_classes) + 1))
-                            
-                            # Create Class -> Color LUT
-                            n_classes = len(self.model.class_colors)
-                            class_color_lut = np.zeros((n_classes + 1, 3), dtype=np.uint8)
-                            class_color_lut[1:] = self.model.class_colors # Index 1..N
-                            
-                            # Map mask IDs to Class IDs, then to Colors
-                            # Clip class IDs to ensure they are within range of class_color_lut
-                            safe_class_ids = np.clip(mask_classes[:max_id+1], 0, n_classes)
-                            color_lut = class_color_lut[safe_class_ids]
-                        else:
-                            # Map Mask ID -> Instance Color
-                            instance_colors = self.model.instance_colors
-                            if len(instance_colors) <= max_id:
-                                # Generate missing colors on the fly if needed (though model should handle this)
-                                missing = max_id - len(instance_colors) + 1
-                                new_cols = np.random.randint(0, 255, (missing, 3), dtype=np.uint8)
-                                instance_colors = np.vstack([instance_colors, new_cols])
-                                self.model.instance_colors = instance_colors
-                            color_lut = instance_colors[:max_id+1]
+            if source_masks is not None and source_masks.max() > 0:
+                current_state = self.model.get_channel_state(current_idx) if hasattr(self.model, "get_channel_state") else {
+                    "mask_classes": self.model.mask_classes,
+                    "instance_colors": self.model.instance_colors,
+                }
+                current_rgba = self._render_mask_layer(
+                    source_masks,
+                    current_state,
+                    alpha_val=255 if is_outline_mode else 100,
+                    selected_ids=self.model.get_selected_mask_ids() if hasattr(self.model, "get_selected_mask_ids") else set(),
+                    selection_color=np.array([255, 255, 255], dtype=np.uint8),
+                )
+                self._blit_rgba(mask_display, current_rgba)
 
-                        # 3. Prepare Visibility Lookup Table
-                        # Mask ID -> Visible (bool)
-                        vis_lut = np.ones(max_id + 1, dtype=bool)
-                        vis_lut[0] = False # Background always invisible
-                        
-                        # Apply class visibility
-                        mask_classes = self.model.mask_classes
-                        if len(mask_classes) <= max_id:
-                             # Use -1 for unknown/unassigned class IDs so they can be hidden.
-                             mask_classes = np.pad(
-                                 mask_classes,
-                                 (0, max_id - len(mask_classes) + 1),
-                                 constant_values=-1
-                             )
-                        
-                        class_vis_config = self.model.view_config.class_visible
-                        # Iterate classes to disable invisible ones
-                        for i, is_visible in enumerate(class_vis_config):
-                            class_id = i + 1
-                            if not is_visible:
-                                # Find masks belonging to this class and hide them
-                                # Note: This is a boolean array operation on the LUT
-                                vis_lut[mask_classes[:max_id+1] == class_id] = False
-                        # Hide any mask IDs that have invalid/unassigned class IDs.
-                        invalid_class = mask_classes[:max_id+1] < 1
-                        vis_lut[invalid_class] = False
+        # Redraw the selected previous-channel mask on top so it remains visible
+        # even when the current-channel masks overlap it.
+        if (
+            association_mode_enabled
+            and ref_masks is not None
+            and selected_reference_mask_id is not None
+        ):
+            selected_ref_masks = np.where(ref_masks == int(selected_reference_mask_id), ref_masks, 0)
+            if selected_ref_masks.max() > 0:
+                selected_ref_rgba = self._render_mask_layer(
+                    selected_ref_masks,
+                    ref_state,
+                    alpha_val=70,
+                    force_color=np.array([255, 215, 0], dtype=np.uint8),
+                    selected_ids={int(selected_reference_mask_id)},
+                    selection_color=np.array([0, 255, 255], dtype=np.uint8),
+                )
+                self._blit_rgba(mask_display, selected_ref_rgba)
+            if hasattr(self.model, "get_mask_centroid"):
+                center = self.model.get_mask_centroid(reference_idx, int(selected_reference_mask_id))
+                if center is not None:
+                    cy, cx = center
+                    self.reference_selection_points_item.setData(x=[cx], y=[cy])
+                else:
+                    self.reference_selection_points_item.setData(x=[], y=[])
+            else:
+                self.reference_selection_points_item.setData(x=[], y=[])
+        else:
+            self.reference_selection_points_item.setData(x=[], y=[])
 
-                        # 4. Render
-                        # Apply visibility to LUT (set invisible colors to 0)
-                        # We handle alpha separately
-                        
-                        # Get pixels
-                        mask_pixels = source_masks
-                        
-                        # Look up colors
-                        rgb = color_lut[mask_pixels]
-                        
-                        # Look up visibility per pixel
-                        is_visible = vis_lut[mask_pixels]
-                        
-                        # Assign to display buffer
-                        mask_display[is_visible, :3] = rgb[is_visible]
-                        
-                        # Set Alpha
-                        alpha_val = 255 if is_outline_mode else 100
-                        mask_display[is_visible, 3] = alpha_val
+        segments = []
+        if reference_idx is not None and hasattr(self.model, "get_association_line_segments"):
+            segments = self.model.get_association_line_segments(reference_idx, current_idx)
+        self._update_association_overlay(segments)
 
-                        selected_ids = self.model.get_selected_mask_ids() if hasattr(self.model, "get_selected_mask_ids") else set()
-                        if selected_ids:
-                            ref_masks = self.model.cellpix[z] if self.model.cellpix is not None else source_masks
-                            if ref_masks is None:
-                                ref_masks = source_masks
-                            sel_labels = np.where(np.isin(ref_masks, list(selected_ids)), ref_masks, 0)
-                            if sel_labels.max() > 0:
-                                outlines = utils.masks_to_outlines(sel_labels)
-                                mask_display[outlines > 0, :3] = 255
-                                mask_display[outlines > 0, 3] = 255
-            
-            self.drawing_item.setImage(mask_display, autoLevels=False)
-            self.drawing_item.setLevels([0, 255])
+        self.drawing_item.setImage(mask_display, autoLevels=False)
+        self.drawing_item.setLevels([0, 255])
+
+    def _clear_association_overlay(self):
+        for item in (
+            getattr(self, "association_lines_item", None),
+            getattr(self, "association_selected_lines_item", None),
+            getattr(self, "association_points_item", None),
+            getattr(self, "association_selected_points_item", None),
+            getattr(self, "reference_selection_points_item", None),
+        ):
+            if item is None:
+                continue
+            try:
+                item.setData([], [])
+            except TypeError:
+                item.setData(x=[], y=[])
+
+    def _update_association_overlay(self, segments):
+        if not segments:
+            self._clear_association_overlay()
+            return
+        line_x = []
+        line_y = []
+        selected_line_x = []
+        selected_line_y = []
+        point_x = []
+        point_y = []
+        selected_point_x = []
+        selected_point_y = []
+        for seg in segments:
+            ref_y, ref_x = seg["reference_center"]
+            cur_y, cur_x = seg["current_center"]
+            if seg.get("selected"):
+                selected_line_x.extend([ref_x, cur_x, np.nan])
+                selected_line_y.extend([ref_y, cur_y, np.nan])
+                selected_point_x.extend([ref_x, cur_x])
+                selected_point_y.extend([ref_y, cur_y])
+            else:
+                line_x.extend([ref_x, cur_x, np.nan])
+                line_y.extend([ref_y, cur_y, np.nan])
+                point_x.extend([ref_x, cur_x])
+                point_y.extend([ref_y, cur_y])
+        self.association_lines_item.setData(x=line_x, y=line_y, connect="finite")
+        self.association_selected_lines_item.setData(x=selected_line_x, y=selected_line_y, connect="finite")
+        self.association_points_item.setData(x=point_x, y=point_y)
+        self.association_selected_points_item.setData(x=selected_point_x, y=selected_point_y)
+
+    def _blit_rgba(self, base, overlay):
+        if overlay is None:
+            return
+        if overlay.shape[:2] != base.shape[:2]:
+            _logger.warning(
+                "Skipping mask overlay: image shape %s does not match mask shape %s. "
+                "Re-run inference on this image to regenerate masks at the correct resolution.",
+                base.shape[:2], overlay.shape[:2],
+            )
+            return
+        mask = overlay[:, :, 3] > 0
+        base[mask] = overlay[mask]
+
+    def _render_mask_layer(self, source_masks, state, alpha_val, force_color=None, selected_ids=None, selection_color=None):
+        if source_masks is None or source_masks.max() <= 0:
+            return None
+        max_id = int(source_masks.max())
+        rgba = np.zeros(source_masks.shape + (4,), dtype=np.uint8)
+        color_lut = np.zeros((max_id + 1, 3), dtype=np.uint8)
+        if force_color is not None:
+            color_lut[1:] = np.asarray(force_color, dtype=np.uint8)
+            vis_lut = np.ones(max_id + 1, dtype=bool)
+            vis_lut[0] = False
+        elif self.model.view_config.color_by_class:
+            mask_classes = np.asarray(state.get("mask_classes"), dtype=np.int16)
+            if len(mask_classes) <= max_id:
+                mask_classes = np.pad(mask_classes, (0, max_id - len(mask_classes) + 1))
+            n_classes = len(self.model.class_colors)
+            class_color_lut = np.zeros((n_classes + 1, 3), dtype=np.uint8)
+            class_color_lut[1:] = self.model.class_colors
+            safe_class_ids = np.clip(mask_classes[: max_id + 1], 0, n_classes)
+            color_lut = class_color_lut[safe_class_ids]
+            vis_lut = np.ones(max_id + 1, dtype=bool)
+            vis_lut[0] = False
+            for i, is_visible in enumerate(self.model.view_config.class_visible):
+                class_id = i + 1
+                if not is_visible:
+                    vis_lut[mask_classes[: max_id + 1] == class_id] = False
+            vis_lut[mask_classes[: max_id + 1] < 1] = False
+        else:
+            instance_colors = np.asarray(state.get("instance_colors"), dtype=np.uint8)
+            if len(instance_colors) <= max_id:
+                missing = max_id - len(instance_colors) + 1
+                new_cols = np.random.randint(0, 255, (missing, 3), dtype=np.uint8)
+                instance_colors = np.vstack([instance_colors, new_cols])
+            color_lut = instance_colors[: max_id + 1]
+            vis_lut = np.ones(max_id + 1, dtype=bool)
+            vis_lut[0] = False
+
+        rgb = color_lut[source_masks]
+        is_visible = vis_lut[source_masks]
+        rgba[is_visible, :3] = rgb[is_visible]
+        rgba[is_visible, 3] = alpha_val
+
+        if selected_ids:
+            sel_labels = np.where(np.isin(source_masks, list(selected_ids)), source_masks, 0)
+            if sel_labels.max() > 0:
+                outlines = utils.masks_to_outlines(sel_labels)
+                color = np.asarray(selection_color if selection_color is not None else np.array([255, 255, 255], dtype=np.uint8), dtype=np.uint8)
+                rgba[outlines > 0, :3] = color
+                rgba[outlines > 0, 3] = 255
+        return rgba
 
     def display_image(self, image_data):
         self.img_item.setImage(image_data, autoLevels=False, levels=(0, 255))

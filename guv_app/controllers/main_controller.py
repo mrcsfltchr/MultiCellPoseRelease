@@ -61,9 +61,11 @@ class MainController(QObject):
         Connect UI signals from the View to the controller's handler methods.
         """
         self.view.file_loaded.connect(self.handle_load_image)
+        self.view.import_seg_requested.connect(self.handle_import_segmentation)
         self.view.folder_selected.connect(self.handle_run_on_folder)
         self.view.navigate_next_requested.connect(self.handle_navigate_next)
         self.view.navigate_prev_requested.connect(self.handle_navigate_prev)
+        self.view.navigate_z_requested.connect(self.handle_navigate_z)
         self.view.connect_remote_requested.connect(self.handle_connect_remote_request)
         self.view.disconnect_remote_requested.connect(self.handle_disconnect_remote_request)
         self.view.add_ssh_hostname_requested.connect(self.handle_add_ssh_hostname)
@@ -76,14 +78,19 @@ class MainController(QObject):
             self.view.control_panel.cancel_local_button.clicked.connect(self.handle_cancel_local_inference)
         self.view.toggle_masks_requested.connect(self.handle_toggle_masks_shortcut)
         self.view.toggle_outlines_requested.connect(self.handle_toggle_outlines_shortcut)
+        self.view.toggle_freeze_masks_requested.connect(self.handle_toggle_freeze_masks_shortcut)
         self.view.toggle_color_mode_requested.connect(self.handle_toggle_color_mode_shortcut)
         self.view.toggle_visualization_requested.connect(self.handle_toggle_visualization_shortcut)
+        self.view.move_selected_masks_requested.connect(self.handle_move_selected_masks)
         self.view.brush_size_change_requested.connect(self.handle_brush_size_change)
         self.view.view_mode_step_requested.connect(self.handle_view_mode_step)
         self.view.color_mode_step_requested.connect(self.handle_color_mode_step)
         self.view.color_mode_set_requested.connect(self.handle_color_mode_set)
         self.view.finalize_stroke_requested.connect(self.handle_finalize_stroke)
-        
+        self.view.toggle_association_mode_requested.connect(self.handle_toggle_association_mode)
+        self.view.auto_associate_requested.connect(self.handle_auto_associate_previous_channel)
+        self.view.link_association_requested.connect(self.handle_link_selected_association)
+
         # Connect statistics button if it exists in the view
         if hasattr(self.view.control_panel, 'run_statistics_button'):
             self.view.control_panel.run_statistics_button.clicked.connect(self.handle_run_statistics)
@@ -92,6 +99,8 @@ class MainController(QObject):
         self.view.drawing_item.stroke_finished.connect(self.handle_add_mask_from_stroke)
         self.view.control_panel.masks_checkbox.stateChanged.connect(self.handle_toggle_masks)
         self.view.control_panel.outlines_checkbox.stateChanged.connect(self.handle_toggle_outlines)
+        if hasattr(self.view.control_panel, "freeze_masks_checkbox"):
+            self.view.control_panel.freeze_masks_checkbox.stateChanged.connect(self.handle_toggle_freeze_masks)
 
         # Class management signals
         self.view.control_panel.add_class_button.clicked.connect(self.handle_add_new_class)
@@ -283,6 +292,10 @@ class MainController(QObject):
     def _on_image_loaded(self, image_data, filename, frame_id, frame_refs):
         self.view.set_progress_busy(False)
         self._cleanup_load_thread()
+        self.model.previous_channel_index = None
+        self.model.clear_reference_selection()
+        if hasattr(self.view, "set_association_mode_enabled"):
+            self.view.set_association_mode_enabled(False)
         if image_data is None:
             _logger.error(f"Controller: Failed to load image {filename}")
             return
@@ -350,11 +363,16 @@ class MainController(QObject):
                 self.view.control_panel.inference_channel_dropdown.setCurrentIndex(
                     min(current + 1, channel_count)
                 )
+        source_image = image_data  # preserve original pixel values for intensity measurements
         self.model.frame_id = frame_id
         if frame_id:
             parts = self.image_service.parse_frame_id(frame_id)
             self.model.series_index = parts.get("S", parts.get("P"))
-        self.model.update_image(normalized_data, filename)
+            self.model.current_z_index = parts.get("Z", 0)
+        else:
+            self.model.current_z_index = 0
+        self.model.z_count = self.image_service.get_z_info(filename, frame_id=frame_id)
+        self.model.update_image(normalized_data, filename, source_image=source_image)
         self.model.frame_refs = frame_refs if use_frame_refs else []
         if hasattr(self.view, "control_panel"):
             self.view.control_panel.run_series_button.setEnabled(bool(self.model.frame_refs))
@@ -365,8 +383,13 @@ class MainController(QObject):
         if self.model.raw_image is not None and self.model.raw_image.ndim == 3:
             chan_count = self.model.raw_image.shape[2]
             if chan_count > 1:
+                msg = f"Channel: {self.model.view_config.channel_index + 1}/{chan_count}"
+                if self.model.z_count > 1:
+                    msg += f"  |  Z: {self.model.current_z_index + 1}/{self.model.z_count}  (Q/E to navigate)"
+                self.view.statusBar().showMessage(msg)
+            elif self.model.z_count > 1:
                 self.view.statusBar().showMessage(
-                    f"Channel: {self.model.view_config.channel_index + 1}/{chan_count}"
+                    f"Z: {self.model.current_z_index + 1}/{self.model.z_count}  (Q/E to navigate)"
                 )
         self.init_sliders(normalized_data)
         self.refresh_class_list()
@@ -460,9 +483,73 @@ class MainController(QObject):
                         self.model.class_names = list(dat['class_names'])
                     if 'class_colors' in dat and dat['class_colors'] is not None:
                         self.model.class_colors = np.asarray(dat['class_colors'], dtype=np.uint8)
-                        
-                    success = self.model.add_masks(masks, classes=classes)
-                    
+
+                    channel_segmentations = dat.get("channel_segmentations")
+                    associations = dat.get("associations")
+                    active_channel_index = int(dat.get("active_channel_index", self.model.get_current_channel_index()))
+
+                    raw_masks_have_data = masks is not None and int(np.asarray(masks).max()) > 0
+
+                    if channel_segmentations:
+                        stored_masks_ok = any(
+                            isinstance(s, dict)
+                            and s.get("masks") is not None
+                            and int(np.asarray(s["masks"]).max()) > 0
+                            for s in channel_segmentations.values()
+                        )
+
+                        if stored_masks_ok or not raw_masks_have_data:
+                            self._repair_channel_seg_colors(channel_segmentations)
+                            if 'class_names' in dat and dat['class_names'] is not None:
+                                self.model.class_names = list(dat['class_names'])
+                            if 'class_colors' in dat and dat['class_colors'] is not None:
+                                self.model.class_colors = np.asarray(dat['class_colors'], dtype=np.uint8)
+                            current_ch = self.model.get_current_channel_index()
+                            current_state = (
+                                channel_segmentations.get(str(current_ch))
+                                or channel_segmentations.get(current_ch)
+                            )
+                            current_ch_has_masks = (
+                                isinstance(current_state, dict)
+                                and current_state.get("masks") is not None
+                                and int(np.asarray(current_state["masks"]).max()) > 0
+                            )
+                            switch_ch = not current_ch_has_masks
+                            self.model.load_channel_segmentations(
+                                channel_segmentations,
+                                active_channel_index=active_channel_index,
+                                switch_channel=switch_ch,
+                            )
+                            self.model.load_associations(associations)
+                            success = True
+                        else:
+                            success = self.model.add_masks(masks, classes=classes)
+                            if success:
+                                self.model.persist_current_channel_state()
+                            self.model.load_associations(associations)
+                    elif active_channel_index != self.model.get_current_channel_index() and self.model.get_channel_count() > 1:
+                        n_masks = int(np.asarray(masks).max()) if raw_masks_have_data else 0
+                        instance_colors = np.random.randint(0, 255, (n_masks + 1, 3), dtype=np.uint8)
+                        payload = {
+                            str(active_channel_index): {
+                                "masks": masks,
+                                "classes": classes,
+                                "instance_colors": instance_colors,
+                            }
+                        }
+                        self.model.load_channel_segmentations(
+                            payload,
+                            active_channel_index=active_channel_index,
+                            switch_channel=False,
+                        )
+                        self.model.load_associations(associations)
+                        success = True
+                    else:
+                        success = self.model.add_masks(masks, classes=classes)
+                        if success:
+                            self.model.persist_current_channel_state()
+                        self.model.load_associations(associations)
+
                     if success:
                         msg = "predictions" if target_file.endswith('_pred.npy') else "segmentation"
                         self.view.statusBar().showMessage(f"Loaded {msg} from {os.path.basename(target_file)}")
@@ -472,6 +559,27 @@ class MainController(QObject):
             except Exception as e:
                 _logger.warning(f"Failed to autoload masks from {target_file}: {e}")
                 self.view.statusBar().showMessage(f"Failed to load masks: {e}")
+
+    @staticmethod
+    def _repair_channel_seg_colors(channel_segmentations):
+        """Ensures every channel slot with masks has non-zero (visible) instance_colors.
+
+        Repairs files that were saved while instance_colors was still all-zeros
+        (black), which makes mask overlays invisible in the view.
+        """
+        for slot_state in (channel_segmentations or {}).values():
+            if not isinstance(slot_state, dict):
+                continue
+            slot_masks = slot_state.get("masks")
+            if slot_masks is None:
+                continue
+            n = int(np.asarray(slot_masks).max())
+            if n > 0:
+                colors = slot_state.get("instance_colors")
+                if colors is None or not np.any(np.asarray(colors)):
+                    slot_state["instance_colors"] = np.random.randint(
+                        0, 255, (n + 1, 3), dtype=np.uint8
+                    )
 
     def init_sliders(self, image):
         """Initializes slider ranges based on the loaded image."""
@@ -541,6 +649,29 @@ class MainController(QObject):
                 self.handle_load_image(prev_file)
             else:
                 self.view.statusBar().showMessage("Start of folder reached.")
+
+    def handle_navigate_z(self, delta):
+        """Steps through Z slices using Q (prev) / E (next)."""
+        if self.model.z_count <= 1:
+            return
+        self._autosave_and_flush_before_navigation()
+        new_z = max(0, min(self.model.current_z_index + delta, self.model.z_count - 1))
+        if new_z == self.model.current_z_index:
+            if new_z == 0:
+                self.view.statusBar().showMessage("Already at first Z slice.")
+            else:
+                self.view.statusBar().showMessage("Already at last Z slice.")
+            return
+        filename = self.model.filename
+        if not filename:
+            return
+        frame_id = self.model.frame_id or ""
+        # Strip any existing Z component then append the new one
+        parts = [p for p in frame_id.split("_") if not (len(p) >= 2 and p[0] == "Z" and p[1:].isdigit())]
+        parts.append(f"Z{new_z}")
+        new_frame_id = "_".join(p for p in parts if p)
+        ref = self.image_service.build_image_reference(filename, new_frame_id)
+        self.handle_load_image(ref)
 
     def _autosave_and_flush_before_navigation(self):
         """
@@ -1128,11 +1259,19 @@ class MainController(QObject):
         self.model.view_config.show_visualization = (Qt.CheckState(state) == Qt.CheckState.Checked)
         self.model.trigger_view_update()
 
+    def handle_toggle_freeze_masks(self, state):
+        """Handles the freeze masks toggle checkbox."""
+        self.model.view_config.masks_frozen = (Qt.CheckState(state) == Qt.CheckState.Checked)
+
     def handle_toggle_masks_shortcut(self):
         self.view.control_panel.masks_checkbox.toggle()
 
     def handle_toggle_outlines_shortcut(self):
         self.view.control_panel.outlines_checkbox.toggle()
+
+    def handle_toggle_freeze_masks_shortcut(self):
+        if hasattr(self.view.control_panel, "freeze_masks_checkbox"):
+            self.view.control_panel.freeze_masks_checkbox.toggle()
 
     def handle_toggle_color_mode_shortcut(self):
         self.view.control_panel.color_by_class_checkbox.toggle()
@@ -1306,9 +1445,16 @@ class MainController(QObject):
             return
         chan_count = img.shape[2]
         new_idx = max(0, min(int(new_idx), chan_count - 1))
+        old_idx = int(self.model.view_config.channel_index)
+        if new_idx == old_idx:
+            return
+        self.model.persist_current_channel_state()
+        self.model.previous_channel_index = old_idx if self.model.channel_has_masks(old_idx) else None
         self.model.view_config.channel_index = new_idx
+        self.model.restore_channel_state(new_idx)
         self._apply_display_modes()
-        self.view.statusBar().showMessage(f"Channel: {new_idx + 1}/{chan_count}")
+        ref_text = f" | ref {self.model.previous_channel_index + 1}" if self.model.previous_channel_index is not None else ""
+        self.view.statusBar().showMessage(f"Channel: {new_idx + 1}/{chan_count}{ref_text}")
 
     def _render_flow_view(self, view_mode):
         flows = self.model.flows
@@ -1354,6 +1500,89 @@ class MainController(QObject):
         image = np.clip(image, 0, 255)
         return image.astype(np.uint8)
 
+    def handle_move_selected_masks(self, dx, dy):
+        if self.model.view_config.show_visualization and self.model.visualization_masks is not None:
+            self.view.statusBar().showMessage("Disable visualization mode before moving masks.")
+            return
+        moved, message = self.model.translate_selected_masks(dx=dx, dy=dy)
+        self.view.statusBar().showMessage(message)
+        if moved:
+            self._trigger_autosave()
+
+    def handle_import_segmentation(self, seg_path):
+        if not self.model.filename or self.model.raw_image is None:
+            self.view.statusBar().showMessage("Load an image before importing a segmentation.")
+            return
+        try:
+            seg = self.image_service.load_segmentation_data(seg_path)
+        except Exception as e:
+            self.view.statusBar().showMessage(f"Failed to load segmentation: {e}")
+            return
+
+        self.model.clear_masks()
+        if seg["class_names"] is not None:
+            self.model.class_names = list(seg["class_names"])
+        if seg["class_colors"] is not None:
+            self.model.class_colors = np.asarray(seg["class_colors"], dtype=np.uint8)
+        channel_segmentations = seg.get("channel_segmentations")
+        associations = seg.get("associations")
+        active_channel_index = int(seg.get("active_channel_index", self.model.get_current_channel_index()))
+        if channel_segmentations:
+            self._repair_channel_seg_colors(channel_segmentations)
+            self.model.load_channel_segmentations(channel_segmentations, active_channel_index=active_channel_index)
+            self.model.load_associations(associations)
+            success = True
+        else:
+            success = self.model.add_masks(seg["masks"], classes=seg["classes"])
+            self.model.load_associations(associations)
+        if not success:
+            self.view.statusBar().showMessage("Imported segmentation does not match the active image shape.")
+            return
+
+        self.refresh_class_list()
+        self.image_service.save_segmentation(self.model)
+        self.view.statusBar().showMessage(
+            f"Imported {os.path.basename(seg_path)} onto {os.path.basename(self.model.filename)}"
+        )
+
+    def handle_toggle_association_mode(self, enabled):
+        enabled = bool(enabled)
+        self.model.clear_reference_selection()
+        if hasattr(self.view, "set_association_mode_enabled"):
+            self.view.set_association_mode_enabled(enabled)
+        self.model.trigger_view_update()
+        self.view.statusBar().showMessage(
+            "Association mode enabled. Previous-channel masks are shown in gold. "
+            "Alt+click one, click a current mask, then press L to link. Green lines show linked pairs."
+            if enabled else "Association mode disabled."
+        )
+
+    def handle_auto_associate_previous_channel(self):
+        matched, message = self.model.auto_associate_with_previous_channel()
+        self.model.trigger_view_update()
+        self.view.statusBar().showMessage(message)
+        if matched > 0:
+            self._trigger_autosave()
+
+    def handle_link_selected_association(self):
+        current_channel = self.model.get_current_channel_index()
+        reference_channel = self.model.previous_channel_index
+        selected_ids = sorted(self.model.get_selected_mask_ids())
+        reference_mask_id = getattr(self.model, "selected_reference_mask_id", None)
+        if reference_channel is None or reference_mask_id is None:
+            self.view.statusBar().showMessage("Select a previous-channel mask with Alt+click in association mode.")
+            return
+        if len(selected_ids) != 1:
+            self.view.statusBar().showMessage("Select exactly one current-channel mask to link.")
+            return
+        self.model.associate_masks(reference_channel, reference_mask_id, current_channel, selected_ids[0])
+        self.model.trigger_view_update()
+        self._trigger_autosave()
+        self.view.statusBar().showMessage(
+            f"Linked channel {reference_channel + 1} mask {reference_mask_id} "
+            f"to channel {current_channel + 1} mask {selected_ids[0]}. Green line updated."
+        )
+
     def handle_class_visibility(self, class_index, is_visible):
         """Handles toggling the visibility of a specific class."""
         if class_index < len(self.model.view_config.class_visible):
@@ -1386,11 +1615,12 @@ class MainController(QObject):
         if count <= 0:
             self.view.statusBar().showMessage("No masks selected.")
         else:
-            self.view.statusBar().showMessage(f"Selected {count} masks. Shift+click to assign class.")
+            self.view.statusBar().showMessage(f"Selected {count} masks. Shift+click to assign class or press L to link in association mode.")
         self.model.trigger_view_update()
 
     def handle_clear_selected_masks(self):
         self.model.clear_selected_masks()
+        self.model.clear_reference_selection()
         self.model.trigger_view_update()
 
     def handle_delete_mask(self, y, x):

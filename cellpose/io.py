@@ -172,7 +172,7 @@ def parse_frame_id(frame_id: Optional[str]) -> Dict[str, int]:
         if len(part) < 2:
             continue
         key = part[0]
-        if key in ("S", "P", "T"):
+        if key in ("S", "P", "T", "Z"):
             try:
                 parsed[key] = int(part[1:])
             except ValueError:
@@ -588,6 +588,15 @@ class _TiffReader(ImageReader):
         time_count = int(sizes.get("T", 1))
         return series_key, series_count, time_count
 
+    def get_z_count(self, filename: str) -> int:
+        with tifffile.TiffFile(filename) as tif:
+            series = tif.series[0]
+            axes = getattr(series, "axes", None)
+            shape = tuple(getattr(series, "shape", ()))
+            axes = self._normalize_axes(series, axes, shape)
+            sizes = _sizes_from_axes(axes, shape)
+        return int(sizes.get("Z", 1))
+
 
 class _Nd2Reader(ImageReader):
     extensions = (".nd2",)
@@ -622,7 +631,8 @@ class _Nd2Reader(ImageReader):
         return _build_axes_from_sizes(shape, sizes)
 
     def _get_frame_2d(self, f, sizes: Dict[str, int], series_key: Optional[str],
-                      series_index: Optional[int], time_index: Optional[int]) -> Optional[np.ndarray]:
+                      series_index: Optional[int], time_index: Optional[int],
+                      z_index: int = 0) -> Optional[np.ndarray]:
         if not hasattr(f, "get_frame_2D"):
             return None
         import inspect
@@ -636,7 +646,7 @@ class _Nd2Reader(ImageReader):
             if "c" in params and c_val is not None:
                 kwargs["c"] = int(c_val)
             if "z" in params and sizes.get("Z", 1) > 1:
-                kwargs["z"] = 0
+                kwargs["z"] = int(z_index)
             if "p" in params and series_key == "P" and s_val is not None:
                 kwargs["p"] = int(s_val)
             if "s" in params and series_key == "S" and s_val is not None:
@@ -653,7 +663,7 @@ class _Nd2Reader(ImageReader):
 
     def _load_dask_frame(self, filename: str, sizes: Dict[str, int], axes: Optional[str],
                          series_key: Optional[str], series_index: Optional[int],
-                         time_index: Optional[int]) -> Optional[np.ndarray]:
+                         time_index: Optional[int], z_index: int = 0) -> Optional[np.ndarray]:
         if not hasattr(nd2, "imread"):
             return None
         try:
@@ -682,7 +692,7 @@ class _Nd2Reader(ImageReader):
         if sizes.get("Z", 1) > 1:
             z_axis = axis_index("Z")
             if z_axis is not None:
-                indexer[z_axis] = 0
+                indexer[z_axis] = int(z_index)
         arr = dask_arr[tuple(indexer)]
         if hasattr(arr, "compute"):
             arr = arr.compute()
@@ -695,11 +705,11 @@ class _Nd2Reader(ImageReader):
 
     def _load_frame(self, f, filename: str, sizes: Dict[str, int], axes: Optional[str],
                     series_key: Optional[str], series_index: Optional[int],
-                    time_index: Optional[int]) -> Optional[np.ndarray]:
-        arr = self._get_frame_2d(f, sizes, series_key, series_index, time_index)
+                    time_index: Optional[int], z_index: int = 0) -> Optional[np.ndarray]:
+        arr = self._get_frame_2d(f, sizes, series_key, series_index, time_index, z_index)
         if arr is not None:
             return arr
-        arr = self._load_dask_frame(filename, sizes, axes, series_key, series_index, time_index)
+        arr = self._load_dask_frame(filename, sizes, axes, series_key, series_index, time_index, z_index)
         if arr is not None:
             return arr
         try:
@@ -719,6 +729,9 @@ class _Nd2Reader(ImageReader):
         if axes_local and time_index is not None and "T" in axes_local:
             arr = np.take(arr, time_index, axis=axes_local.index("T"))
             axes_local = _drop_axis(axes_local, "T")
+        if axes_local and sizes.get("Z", 1) > 1 and "Z" in axes_local:
+            arr = np.take(arr, int(z_index), axis=axes_local.index("Z"))
+            axes_local = _drop_axis(axes_local, "Z")
         if axes_local and "C" in axes_local:
             c_idx = axes_local.index("C")
             if c_idx != len(axes_local) - 1:
@@ -793,6 +806,13 @@ class _Nd2Reader(ImageReader):
                     )
                     yield ImageFrame(arr, meta_out, frame_id)
 
+    def get_z_count(self, filename: str) -> int:
+        if not ND2:
+            return 1
+        meta = self._get_meta(filename)
+        sizes = meta.get("sizes", {}) or {}
+        return int(sizes.get("Z", 1))
+
     def read_frame(self, filename: str, frame_id: Optional[str]) -> Optional[ImageFrame]:
         if not ND2:
             raise RuntimeError("nd2 not installed")
@@ -802,12 +822,13 @@ class _Nd2Reader(ImageReader):
         parsed = parse_frame_id(frame_id)
         series_index = parsed.get("S", parsed.get("P"))
         time_index = parsed.get("T")
+        z_index = parsed.get("Z", 0)
         meta = self._get_meta(filename)
         sizes = meta.get("sizes", {}) or {}
         axes = meta.get("axes", None)
         series_key = "S" if sizes.get("S", 1) > 1 else "P" if sizes.get("P", 1) > 1 else None
         with nd2.ND2File(filename) as f:
-            arr = self._load_frame(f, filename, sizes, axes, series_key, series_index, time_index)
+            arr = self._load_frame(f, filename, sizes, axes, series_key, series_index, time_index, z_index)
         if arr is None:
             return None
         axes_out = "YXC" if arr.ndim == 3 else "YX"
@@ -896,6 +917,33 @@ class _LifReader(ImageReader):
                         time_count = 1
         return series_key, series_count, time_count
 
+    def get_z_count(self, filename: str) -> int:
+        if not LIF:
+            return 1
+        entry = self._get_cache(filename)
+        if entry is None:
+            entry = self._load_cache(filename)
+        images = entry.get("images", [])
+        if not images:
+            return 1
+        return self._get_z_count_for_image(images[0])
+
+    def _get_z_count_for_image(self, img_info) -> int:
+        dims = getattr(img_info, "dims", None)
+        z_val = getattr(dims, "z", None) if dims is not None else None
+        if z_val is not None:
+            try:
+                return max(1, int(z_val))
+            except Exception:
+                pass
+        dims_n = getattr(img_info, "dims_n", None)
+        if isinstance(dims_n, dict) and 3 in dims_n:
+            try:
+                return max(1, int(dims_n[3]))
+            except Exception:
+                pass
+        return 1
+
     def read_frame(self, filename: str, frame_id: Optional[str]) -> Optional[ImageFrame]:
         if not LIF:
             raise RuntimeError("readlif not installed")
@@ -905,6 +953,7 @@ class _LifReader(ImageReader):
         parsed = parse_frame_id(frame_id)
         series_index = parsed.get("S", parsed.get("P", 0))
         time_index = parsed.get("T")
+        z_index = parsed.get("Z", 0)
         entry = self._get_cache(filename)
         if entry is None:
             entry = self._load_cache(filename)
@@ -914,7 +963,7 @@ class _LifReader(ImageReader):
         if series_index < 0 or series_index >= len(images):
             return None
         img_info = images[series_index]
-        arr = self._load_lif_frame(img_info, time_index=time_index)
+        arr = self._load_lif_frame(img_info, time_index=time_index, z_index=z_index)
         if arr is None:
             return None
         arr = _normalize_channels_last(arr)
@@ -941,22 +990,37 @@ class _LifReader(ImageReader):
         self._set_cache(filename, entry)
         return entry
 
-    def _load_lif_frame(self, img_info, time_index: Optional[int] = None) -> Optional[np.ndarray]:
-        if time_index is not None and hasattr(img_info, "get_frame"):
-            if hasattr(img_info, "get_iter_c"):
+    def _load_lif_frame(self, img_info, time_index: Optional[int] = None,
+                        z_index: int = 0) -> Optional[np.ndarray]:
+        z_val = int(z_index) if z_index is not None else 0
+        t_val = int(time_index) if time_index is not None else 0
+        if hasattr(img_info, "get_frame") and hasattr(img_info, "get_iter_c"):
+            try:
+                c_count = len(list(img_info.get_iter_c()))
+            except Exception:
+                c_count = 0
+            if c_count > 0:
+                # Modern readlif: get_frame(z, t, c)
                 try:
-                    c_count = len(list(img_info.get_iter_c()))
-                except Exception:
-                    c_count = 0
-                chans = [
-                    np.asarray(img_info.get_frame(t=int(time_index), c=int(c_idx)))
-                    for c_idx in range(c_count)
-                ]
-                return np.stack(chans, axis=-1) if chans else None
-            return np.asarray(img_info.get_frame(t=int(time_index)))
+                    chans = [
+                        np.asarray(img_info.get_frame(z=z_val, t=t_val, c=int(c_idx)))
+                        for c_idx in range(c_count)
+                    ]
+                    return np.stack(chans, axis=-1)
+                except TypeError:
+                    pass
+                # Intermediate readlif: get_frame(t, c)
+                try:
+                    chans = [
+                        np.asarray(img_info.get_frame(t=t_val, c=int(c_idx)))
+                        for c_idx in range(c_count)
+                    ]
+                    return np.stack(chans, axis=-1)
+                except TypeError:
+                    pass
         if time_index is not None and hasattr(img_info, "get_iter_t"):
             for idx, frame in enumerate(img_info.get_iter_t()):
-                if idx == int(time_index):
+                if idx == t_val:
                     return np.asarray(frame)
         if hasattr(img_info, "get_iter_c"):
             chans = [np.asarray(p) for p in img_info.get_iter_c()]
@@ -1066,6 +1130,30 @@ def get_series_time_info(filename: str) -> Tuple[Optional[str], int, int]:
         time_count = int(sizes.get("T", 1))
         return series_key, series_count, time_count
     return reader.get_series_time_info(filename)
+
+
+def get_z_count(filename: str) -> int:
+    reader = _get_reader(filename)
+    if reader is not None and hasattr(reader, "get_z_count"):
+        return reader.get_z_count(filename)
+    try:
+        data = read_image_data(filename)
+        return int((data.meta.sizes or {}).get("Z", 1))
+    except Exception:
+        return 1
+
+
+def get_z_count_for_lif_series(filename: str, series_index: int = 0) -> int:
+    reader = _get_reader(filename)
+    if not isinstance(reader, _LifReader):
+        return get_z_count(filename)
+    entry = reader._get_cache(filename)
+    if entry is None:
+        entry = reader._load_cache(filename)
+    images = entry.get("images", [])
+    if not images or series_index < 0 or series_index >= len(images):
+        return 1
+    return reader._get_z_count_for_image(images[series_index])
 
 
 register_reader(_TiffReader())

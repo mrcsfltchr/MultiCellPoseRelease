@@ -213,7 +213,7 @@ class ImageService:
             if len(part) < 2:
                 continue
             key = part[0]
-            if key in ("S", "P", "T"):
+            if key in ("S", "P", "T", "Z"):
                 try:
                     parsed[key] = int(part[1:])
                 except ValueError:
@@ -229,6 +229,26 @@ class ImageService:
         except Exception as e:
             _logger.error(f"Error reading image metadata {filename}: {e}")
             return None, 1, 1
+
+    def get_z_info(self, filename, frame_id=None):
+        """Return the number of Z slices for *filename* (1 if no Z axis)."""
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == ".nd2":
+            cached = self._nd2_meta_cache.get(filename)
+            if cached:
+                sizes = cached.get("sizes", {}) or {}
+                return int(sizes.get("Z", 1))
+        if ext == ".lif" and frame_id:
+            try:
+                parsed = self._parse_frame_id(frame_id)
+                series_index = parsed.get("S", parsed.get("P", 0))
+                return io.get_z_count_for_lif_series(filename, series_index)
+            except Exception:
+                pass
+        try:
+            return io.get_z_count(filename)
+        except Exception:
+            return 1
 
     def iter_image_frames(self, filename, series_index=None, frame_id=None):
         """
@@ -339,9 +359,8 @@ class ImageService:
                         return axes.index(key)
                     return None
 
-                z_index = 0
-                if sizes.get("Z", 1) > 1:
-                    z_index = 0
+                z_count = int(sizes.get("Z", 1))
+                z_index = parsed.get("Z", 0) if z_count > 1 else 0
 
                 series_axis = axis_index(series_key) if series_key else None
 
@@ -616,6 +635,64 @@ class ImageService:
             return
         payload = self._build_pred_payload(model, suffix="_pred.npy")
         self._enqueue_save(("pred", payload["save_path"], payload))
+
+    def load_segmentation_data(self, filename):
+        """Loads segmentation data from a .npy file and returns a dict with masks, classes, etc."""
+        dat = np.load(filename, allow_pickle=True).item()
+        channel_segmentations = dat.get("channel_segmentations")
+        active_channel_index = int(dat.get("active_channel_index", 0))
+        active_state = None
+        if channel_segmentations:
+            active_state = channel_segmentations.get(str(active_channel_index))
+            if active_state is None and channel_segmentations:
+                first_key = sorted(channel_segmentations.keys(), key=lambda x: int(x))[0]
+                active_state = channel_segmentations.get(first_key)
+        masks = dat.get("masks")
+        if masks is None and active_state is not None:
+            masks = active_state.get("masks")
+        if masks is None:
+            raise ValueError(f"No masks found in {filename}")
+        masks = np.asarray(masks)
+        if masks.ndim == 3:
+            masks = masks.squeeze()
+        if masks.ndim == 1:
+            raise ValueError(f"Unsupported mask dimensions in {filename}: {masks.shape}")
+
+        classes = dat.get("classes")
+        if classes is None and active_state is not None:
+            classes = active_state.get("classes")
+        if classes is None:
+            classes_map = dat.get("classes_map")
+            if classes_map is None and active_state is not None:
+                classes_map = active_state.get("classes_map")
+            if classes_map is not None:
+                try:
+                    masks_i64 = masks.astype(np.int64, copy=False)
+                    classes_map = np.asarray(classes_map)
+                    if classes_map.shape == masks.shape:
+                        nmask = int(masks_i64.max())
+                        recovered = np.zeros(nmask + 1, dtype=np.int16)
+                        for mid in range(1, nmask + 1):
+                            vals = classes_map[masks_i64 == mid]
+                            if vals.size:
+                                vals = vals.astype(np.int64, copy=False)
+                                vals = vals[vals >= 0]
+                                if vals.size:
+                                    recovered[mid] = int(np.bincount(vals).argmax())
+                        classes = recovered
+                except Exception:
+                    classes = None
+
+        return {
+            "masks": masks,
+            "classes": classes,
+            "class_names": dat.get("class_names"),
+            "class_colors": dat.get("class_colors"),
+            "object_ids": dat.get("object_ids"),
+            "channel_segmentations": channel_segmentations,
+            "associations": dat.get("associations"),
+            "active_channel_index": active_channel_index,
+        }
 
     def _safe_array_copy(self, value):
         if value is None:

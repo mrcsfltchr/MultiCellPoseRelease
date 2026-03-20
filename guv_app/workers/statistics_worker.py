@@ -17,10 +17,10 @@ class StatisticsWorker(BaseWorker):
     progress = pyqtSignal(str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
-    
+
     def __init__(self, image_service, analysis_service, folder_path, plugins=None, plugin_params=None,
                  mask_suffix="_seg.npy", visualization_masks_by_file=None, series_index=None,
-                 visualize_only=False, image_files=None):
+                 visualize_only=False, image_files=None, output_path_prefix=None):
         super().__init__()
         self.image_service = image_service
         self.analysis_service = analysis_service
@@ -32,17 +32,49 @@ class StatisticsWorker(BaseWorker):
         self.series_index = series_index
         self.visualize_only = visualize_only
         self.image_files = image_files
+        self.output_path_prefix = output_path_prefix
+
+    @staticmethod
+    def _build_object_ids_for_channel(dat, channel_index, masks):
+        object_ids = dat.get("object_ids")
+        if object_ids is not None:
+            return np.asarray(object_ids, dtype=np.int32)
+        max_mask_id = int(np.max(masks)) if masks is not None and np.size(masks) else 0
+        out = np.zeros(max_mask_id + 1, dtype=np.int32)
+        associations = dat.get("associations") or {}
+        groups = associations.get("groups") or []
+        for group in groups:
+            object_id = int(group.get("object_id", 0))
+            for member in group.get("members") or []:
+                if int(member.get("channel", -1)) == int(channel_index):
+                    mask_id = int(member.get("mask_id", 0))
+                    if 0 < mask_id < len(out):
+                        out[mask_id] = object_id
+        return out
+
+    def _augment_plugin_params(self, plugin_params, dat, masks):
+        params = {name: dict(values) for name, values in (plugin_params or {}).items()}
+        channel_index = int(dat.get("active_channel_index", 0))
+        object_ids = self._build_object_ids_for_channel(dat, channel_index, masks)
+        for plugin in self.plugins or []:
+            name = plugin.name
+            if name not in params:
+                params[name] = {}
+            params[name].setdefault("channel_index", channel_index)
+            params[name].setdefault("object_ids_by_mask", object_ids)
+            params[name].setdefault("channel_segmentations", dat.get("channel_segmentations"))
+        return params
 
     def run(self):
         try:
             self.progress.emit("Starting statistics analysis...")
-            
+
             # Get files (filtering for images that likely have masks)
             # cellpose.io.get_image_files filters for image extensions and excludes internal files
             image_files = self.image_files
             if image_files is None:
                 image_files = io.get_image_files(self.folder_path, '_masks')
-            
+
             if not image_files:
                 self.error.emit("No images found in the selected folder.")
                 self.finished.emit()
@@ -50,10 +82,10 @@ class StatisticsWorker(BaseWorker):
 
             all_results = {}
             total = len(image_files)
-            
+
             for i, filename in enumerate(image_files):
                 self.progress.emit(f"Processing {i+1}/{total}: {os.path.basename(filename)}")
-                
+
                 try:
                     frames = self.image_service.iter_image_frames(filename, series_index=self.series_index)
                     if not frames:
@@ -76,6 +108,7 @@ class StatisticsWorker(BaseWorker):
 
                         masks = None
                         classes = None
+                        dat = None
 
                         if os.path.exists(seg_file):
                             dat = np.load(seg_file, allow_pickle=True).item()
@@ -89,20 +122,23 @@ class StatisticsWorker(BaseWorker):
                         if masks is None:
                             continue
 
-                        plugin_params = self.plugin_params
+                        plugin_params = self._augment_plugin_params(self.plugin_params, dat or {}, masks)
                         if self.visualization_masks_by_file is not None:
                             ref = filename
                             if frame.frame_id:
                                 ref = f"{filename}::{frame.frame_id}"
                             normalized = os.path.normcase(os.path.normpath(ref))
                             overrides = self.visualization_masks_by_file.get(normalized, {})
-                            base_params = self.plugin_params or {}
-                            plugin_params = {
-                                name: dict(params) for name, params in base_params.items()
-                            }
+                            plugin_params = self._augment_plugin_params(self.plugin_params, dat or {}, masks)
                             for plugin in self.plugins or []:
                                 name = plugin.name
                                 viz_mask = overrides.get(name)
+                                if viz_mask is None and self._plugin_supports_visualization(plugin):
+                                    # Try loading a previously-saved visualization mask from disk
+                                    # before regenerating (covers finalize-after-navigate workflows)
+                                    viz_mask = self.image_service.load_visualization_mask(
+                                        filename, frame.frame_id, plugin_name=name
+                                    )
                                 if viz_mask is None and self._plugin_supports_visualization(plugin):
                                     viz_mask = self.analysis_service.run_visualization(
                                         plugin,
@@ -166,7 +202,7 @@ class StatisticsWorker(BaseWorker):
                             frame_label,
                             time.time() - t_start,
                         )
-                        
+
                 except Exception as e:
                     print(f"Error processing {filename}: {e}")
                     # Don't fail the whole batch for one bad file
@@ -194,17 +230,21 @@ class StatisticsWorker(BaseWorker):
                     safe_name = "".join(
                         x for x in plugin_name if x.isalnum() or x in "._- "
                     ).replace(" ", "_")
-                    save_path = os.path.join(
-                        self.folder_path,
-                        f"statistics_results__{safe_name}{series_suffix}.csv",
-                    )
+                    if self.output_path_prefix is not None:
+                        channel_suffix = _channel_suffix_from_df(final_df)
+                        save_path = f"{self.output_path_prefix}{safe_name}{channel_suffix}.csv"
+                    else:
+                        save_path = os.path.join(
+                            self.folder_path,
+                            f"statistics_results__{safe_name}{series_suffix}.csv",
+                        )
                     final_df.to_csv(save_path, index=False)
                     self.progress.emit(f"Saved results to {os.path.basename(save_path)}")
             else:
                 self.progress.emit("No analysis results generated (were masks present?).")
 
             self.finished.emit()
-            
+
         except Exception as e:
             self.error.emit(str(e))
             self.finished.emit()
@@ -215,3 +255,14 @@ class StatisticsWorker(BaseWorker):
             return plugin.visualize.__func__ is not AnalysisPlugin.visualize
         except AttributeError:
             return False
+
+
+def _channel_suffix_from_df(df):
+    if "intensity_channel_name" not in df.columns:
+        return ""
+    values = [str(v).strip() for v in df["intensity_channel_name"].dropna().unique() if str(v).strip()]
+    if len(values) == 1:
+        val = "".join(c for c in values[0] if c.isalnum() or c in "._-").lower()
+        if val:
+            return f"_{val}"
+    return "_multi_channel" if values else ""

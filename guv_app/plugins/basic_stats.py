@@ -21,68 +21,173 @@ class BasicStatsPlugin(AnalysisPlugin):
                 "default": "all",
                 "options": ["all", "1", "2", "3"],
                 "label": "Intensity Channel",
-                "help": "'all' averages channels. 1/2/3 selects R/G/B channel.",
+                "help": (
+                    "'all' saves mean_intensity (cross-channel mean) plus "
+                    "mean_intensity_ch1, mean_intensity_ch2, ... columns. "
+                    "1/2/3 selects a specific channel only."
+                ),
             }
         }
 
     def run(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> pd.DataFrame:
-        if masks is None or masks.max() == 0:
+        if masks is None or np.asarray(masks).max() == 0:
             return pd.DataFrame()
-
-        intensity_img = image
-        if intensity_img is None:
+        if image is None:
             return pd.DataFrame()
 
         intensity_channel = _parse_intensity_channel(kwargs.get("intensity_channel", "all"))
-        channel_name = _format_intensity_channel_name(intensity_channel)
-        try:
-            intensity_img = _match_intensity_to_masks(
-                intensity_img,
-                masks,
-                intensity_channel=intensity_channel,
-            )
-        except ValueError as exc:
-            _logger.warning(f"Basic Stats: {exc}")
-            return pd.DataFrame()
 
-        labels = masks.astype(np.int32, copy=False)
+        # Squeeze masks to 2D for consistent morphology + intensity computation
+        labels = np.squeeze(np.asarray(masks)).astype(np.int32, copy=False)
+        if labels.ndim > 2:
+            labels = labels[0]
         max_label = int(labels.max())
         if max_label <= 0:
             return pd.DataFrame()
 
         flat_labels = labels.ravel()
-        flat_intensity = intensity_img.ravel()
         area = np.bincount(flat_labels, minlength=max_label + 1)
-        intensity_sum = np.bincount(flat_labels, weights=flat_intensity, minlength=max_label + 1)
-        mean_intensity = np.zeros_like(intensity_sum, dtype=np.float64)
         nonzero = area > 0
-        mean_intensity[nonzero] = intensity_sum[nonzero] / area[nonzero]
 
+        # Perimeter via 4-connectivity boundary detection on 2D labels
         padded = np.pad(labels, 1, mode="edge")
         center = padded[1:-1, 1:-1]
-        up = padded[:-2, 1:-1]
-        down = padded[2:, 1:-1]
-        left = padded[1:-1, :-2]
-        right = padded[1:-1, 2:]
-        boundary = (center != up) | (center != down) | (center != left) | (center != right)
-        boundary_labels = center[boundary]
-        perimeter = np.bincount(boundary_labels, minlength=max_label + 1).astype(np.float64)
+        boundary = (
+            (center != padded[:-2, 1:-1]) |
+            (center != padded[2:,  1:-1]) |
+            (center != padded[1:-1, :-2]) |
+            (center != padded[1:-1, 2:])
+        )
+        perimeter = np.bincount(center[boundary], minlength=max_label + 1).astype(np.float64)
 
         mask_ids = np.arange(1, max_label + 1, dtype=np.int32)
         df = pd.DataFrame({
             "mask_id": mask_ids,
             "area": area[1:],
             "perimeter": perimeter[1:],
-            "mean_intensity": mean_intensity[1:],
-            "intensity_channel_name": channel_name,
         })
 
-        if classes is not None and "mask_id" in df.columns:
+        # ── Intensity ────────────────────────────────────────────────────────
+        if intensity_channel == -1:
+            # "all" mode: per-channel columns + cross-channel mean
+            per_channel = _compute_per_channel_means(
+                image, labels, flat_labels, area, nonzero, max_label
+            )
+            if per_channel is not None and len(per_channel) > 1:
+                overall = np.mean(np.stack(per_channel, axis=0), axis=0)
+                df["mean_intensity"] = overall
+                for c_idx, ch_means in enumerate(per_channel):
+                    df[f"mean_intensity_ch{c_idx + 1}"] = ch_means
+            else:
+                # Single-channel image or indeterminate axes — produce one column
+                try:
+                    intensity_img = _match_intensity_to_masks(image, masks, intensity_channel=-1)
+                    flat_intensity = _ravel_to_match(intensity_img, labels)
+                    isum = np.bincount(flat_labels, weights=flat_intensity, minlength=max_label + 1)
+                    mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
+                    mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
+                    df["mean_intensity"] = mean_intensity[1:]
+                except ValueError as exc:
+                    _logger.warning("Basic Stats: %s", exc)
+                    return pd.DataFrame()
+            df["intensity_channel_name"] = "all"
+        else:
+            channel_name = _format_intensity_channel_name(intensity_channel)
+            try:
+                intensity_img = _match_intensity_to_masks(image, masks, intensity_channel=intensity_channel)
+            except ValueError as exc:
+                _logger.warning("Basic Stats: %s", exc)
+                return pd.DataFrame()
+            flat_intensity = _ravel_to_match(intensity_img, labels)
+            isum = np.bincount(flat_labels, weights=flat_intensity, minlength=max_label + 1)
+            mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
+            mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
+            df["mean_intensity"] = mean_intensity[1:]
+            df["intensity_channel_name"] = channel_name
+
+        # ── Object ID assignment ─────────────────────────────────────────────
+        object_ids = _normalize_object_ids(kwargs.get("object_ids_by_mask"))
+        has_existing_ids = object_ids is not None and int(np.max(object_ids)) > 0
+
+        if has_existing_ids:
+            df["object_id"] = df["mask_id"].apply(
+                lambda mid: int(object_ids[mid]) if mid < len(object_ids) else 0
+            )
+        else:
+            # Auto-assign: single channel → object_id = mask_id;
+            # multi-channel → IoU matching across channels
+            channel_index = int(kwargs.get("channel_index", 0))
+            channel_segmentations = kwargs.get("channel_segmentations")
+            auto_ids = _auto_assign_object_ids(masks, channel_index, channel_segmentations)
+            df["object_id"] = df["mask_id"].apply(
+                lambda mid: int(auto_ids[mid]) if auto_ids is not None and mid < len(auto_ids) else int(mid)
+            )
+
+        if classes is not None:
             def get_class(mask_id):
                 return int(classes[mask_id]) if mask_id < len(classes) else 0
             df["class_id"] = df["mask_id"].apply(get_class)
 
         return df
+
+
+# ── Intensity helpers ─────────────────────────────────────────────────────────
+
+def _ravel_to_match(intensity_img: np.ndarray, labels_2d: np.ndarray) -> np.ndarray:
+    """Return a float64 1-D array matching labels_2d.ravel() in length."""
+    arr = np.squeeze(intensity_img).astype(np.float64)
+    if arr.shape == labels_2d.shape:
+        return arr.ravel()
+    if arr.size == labels_2d.size:
+        return arr.ravel()
+    raise ValueError(
+        f"Cannot align intensity shape {intensity_img.shape} with labels shape {labels_2d.shape}"
+    )
+
+
+def _compute_per_channel_means(image, labels_2d, flat_labels, area, nonzero, max_label):
+    """
+    Extract per-channel 2D arrays and compute per-mask mean for each.
+    Returns a list of float64 arrays (length max_label), one per channel,
+    or None if the image is single-channel.
+    """
+    arr = np.squeeze(np.asarray(image))
+    if arr.ndim < 3:
+        return None
+
+    # Determine channel axis — use channels-last convention (shape[-1] <= 8),
+    # falling back to channels-first (shape[0] <= 8).
+    if arr.shape[-1] <= 8 and arr.shape[0] > 8 and arr.shape[1] > 8:
+        channel_slices = [arr[..., c] for c in range(arr.shape[-1])]
+    elif arr.shape[0] <= 8 and arr.shape[1] > 8 and arr.shape[2] > 8:
+        channel_slices = [arr[c] for c in range(arr.shape[0])]
+    else:
+        return None
+
+    if len(channel_slices) < 2:
+        return None
+
+    per_channel = []
+    for ch_arr in channel_slices:
+        ch_2d = np.squeeze(ch_arr).astype(np.float64)
+        if ch_2d.shape != labels_2d.shape:
+            if ch_2d.size == labels_2d.size:
+                ch_2d = ch_2d.reshape(labels_2d.shape)
+            else:
+                _logger.warning(
+                    "Basic Stats: channel %d shape %s (size %d) does not match "
+                    "labels shape %s (size %d) — channel will be reported as zeros.",
+                    len(per_channel), ch_2d.shape, ch_2d.size,
+                    labels_2d.shape, labels_2d.size,
+                )
+                per_channel.append(np.zeros(max_label, dtype=np.float64))
+                continue
+        ch_sum = np.bincount(flat_labels, weights=ch_2d.ravel(), minlength=max_label + 1)
+        ch_mean = np.zeros(max_label + 1, dtype=np.float64)
+        ch_mean[nonzero] = ch_sum[nonzero] / area[nonzero]
+        per_channel.append(ch_mean[1:])
+
+    return per_channel
 
 
 def _match_intensity_to_masks(
@@ -147,11 +252,7 @@ def _select_channel_axis_last(arr: np.ndarray, intensity_channel: int) -> np.nda
     return arr[..., intensity_channel]
 
 
-def _collapse_non_spatial_axes(
-    arr: np.ndarray,
-    target_ndim: int,
-    intensity_channel: int,
-) -> np.ndarray:
+def _collapse_non_spatial_axes(arr: np.ndarray, target_ndim: int, intensity_channel: int) -> np.ndarray:
     if arr.ndim <= target_ndim:
         return arr
     if intensity_channel >= 0:
@@ -160,6 +261,158 @@ def _collapse_non_spatial_axes(
         arr = arr.mean(axis=-1)
     return arr
 
+
+# ── Object ID auto-assignment ─────────────────────────────────────────────────
+
+def _auto_assign_object_ids(current_masks, channel_index, channel_segmentations):
+    """
+    Auto-assign object IDs.
+
+    Single channel (no other channel masks available):
+        object_id[mask_id] = mask_id  (1:1 assignment)
+
+    Multiple channels (other channel masks found in channel_segmentations):
+        IoU-based matching across channels → shared object IDs for overlapping masks.
+
+    Returns an int32 array indexed by mask_id (length = max_mask_id + 1),
+    where result[mask_id] = object_id.
+    """
+    masks_by_channel = {channel_index: np.squeeze(np.asarray(current_masks)).astype(np.int32)}
+
+    if channel_segmentations:
+        for key, state in channel_segmentations.items():
+            ch_idx = int(key)
+            if ch_idx == channel_index:
+                continue
+            ch_masks = state.get("masks") if isinstance(state, dict) else state
+            if ch_masks is None:
+                continue
+            ch_masks_2d = np.squeeze(np.asarray(ch_masks)).astype(np.int32)
+            if ch_masks_2d.ndim > 2:
+                ch_masks_2d = ch_masks_2d[0]
+            if ch_masks_2d.ndim == 2 and int(ch_masks_2d.max()) > 0:
+                masks_by_channel[ch_idx] = ch_masks_2d
+
+    max_id = int(masks_by_channel[channel_index].max())
+    result = np.arange(max_id + 1, dtype=np.int32)  # default: object_id = mask_id
+
+    if len(masks_by_channel) <= 1:
+        _logger.debug(
+            "Basic Stats: single channel detected — assigning object_id = mask_id for %d masks.",
+            max_id,
+        )
+        return result
+
+    # Multi-channel: IoU matching
+    _logger.debug(
+        "Basic Stats: matching masks across %d channels via IoU.", len(masks_by_channel)
+    )
+    try:
+        assignment = _iou_match_channels(masks_by_channel)
+        for mask_id in range(1, max_id + 1):
+            result[mask_id] = assignment.get((channel_index, mask_id), mask_id)
+    except Exception as exc:
+        _logger.warning("Basic Stats: IoU object matching failed (%s); falling back to mask_id.", exc)
+
+    return result
+
+
+def _iou_match_channels(masks_by_channel, iou_threshold=0.3):
+    """
+    Union-Find IoU matching across all channel pairs.
+    Returns {(channel_idx, mask_id): object_id}.
+    """
+    channels = sorted(masks_by_channel.keys())
+
+    # ── Union-Find with path compression ────────────────────────────────────
+    parent = {}
+
+    def find(x):
+        root = x
+        while parent.get(root, root) != root:
+            root = parent[root]
+        # path compression
+        cur = x
+        while cur != root:
+            nxt = parent.get(cur, cur)
+            parent[cur] = root
+            cur = nxt
+        return root
+
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    # Initialise one node per (channel, mask_id)
+    for ch_idx, ch_masks in masks_by_channel.items():
+        for mid in range(1, int(ch_masks.max()) + 1):
+            node = (ch_idx, mid)
+            if node not in parent:
+                parent[node] = node
+
+    # Match every pair of channels
+    for i in range(len(channels)):
+        for j in range(i + 1, len(channels)):
+            ch1, ch2 = channels[i], channels[j]
+            _union_overlapping_masks(
+                masks_by_channel[ch1], masks_by_channel[ch2],
+                ch1, ch2, union, iou_threshold,
+            )
+
+    # Assign compact object IDs per connected component
+    component_to_id = {}
+    next_id = [1]
+    result = {}
+    for node in list(parent.keys()):
+        root = find(node)
+        if root not in component_to_id:
+            component_to_id[root] = next_id[0]
+            next_id[0] += 1
+        result[node] = component_to_id[root]
+
+    return result
+
+
+def _union_overlapping_masks(m1, m2, ch1, ch2, union_fn, iou_threshold):
+    """Find all (m1_id, m2_id) pairs with IoU >= threshold and union them."""
+    f1 = m1.ravel().astype(np.int32)
+    f2 = m2.ravel().astype(np.int32)
+    if f1.shape != f2.shape:
+        return
+
+    max1 = int(f1.max())
+    max2 = int(f2.max())
+    if max1 == 0 or max2 == 0:
+        return
+
+    overlap = (f1 > 0) & (f2 > 0)
+    if not overlap.any():
+        return
+
+    ids1 = f1[overlap].astype(np.int64)
+    ids2 = f2[overlap].astype(np.int64)
+    stride = int(max2) + 1
+    pair_keys = ids1 * stride + ids2
+    pair_counts = np.bincount(pair_keys, minlength=(max1 + 1) * stride)
+
+    area1 = np.bincount(f1[f1 > 0], minlength=max1 + 1)
+    area2 = np.bincount(f2[f2 > 0], minlength=max2 + 1)
+
+    for pk in np.unique(pair_keys):
+        id1 = int(pk // stride)
+        id2 = int(pk % stride)
+        if id1 <= 0 or id2 <= 0:
+            continue
+        intersection = int(pair_counts[pk])
+        union_area = int(area1[id1]) + int(area2[id2]) - intersection
+        if union_area <= 0:
+            continue
+        if intersection / union_area >= iou_threshold:
+            union_fn((ch1, id1), (ch2, id2))
+
+
+# ── Misc helpers ──────────────────────────────────────────────────────────────
 
 def _parse_intensity_channel(value) -> int:
     if value is None:
@@ -184,3 +437,12 @@ def _format_intensity_channel_name(channel_index: int) -> str:
     if channel_index < 0:
         return "all"
     return f"ch{channel_index + 1}"
+
+
+def _normalize_object_ids(value):
+    if value is None:
+        return None
+    try:
+        return np.asarray(value, dtype=np.int32)
+    except Exception:
+        return None
