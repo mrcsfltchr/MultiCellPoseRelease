@@ -6,7 +6,10 @@
       "Bash(git checkout:*)",
       "Bash(where:*)",
       "Bash(py -3 -m pytest:*)",
-      "WebFetch(domain:icl-rcs-user-guide.readthedocs.io)"
+      "WebFetch(domain:icl-rcs-user-guide.readthedocs.io)",
+      "Bash(/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe /c/MicrofluidicTrainingDataCollection/MicrofluidicControlImperial/GUI_Control_BD/dreamerv3-torch/MultiCellPose/inspect_stats2.py)",
+      "Bash(/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe /c/MicrofluidicTrainingDataCollection/MicrofluidicControlImperial/GUI_Control_BD/dreamerv3-torch/MultiCellPose/inspect_nd2.py)",
+      "Bash(py --version)"
     ]
   }
 }
