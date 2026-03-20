@@ -151,6 +151,9 @@ class DrawingItem(pg.ImageItem):
         self.delete_mode = bool(enabled)
 
 
+    def set_association_mode(self, enabled):
+        self.association_mode = bool(enabled)
+
     def setDrawKernel(self, kernel_size=3):
         bs = kernel_size
         kernel = np.ones((bs, bs), np.uint8)
