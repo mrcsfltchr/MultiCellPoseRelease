@@ -144,16 +144,31 @@ Critical: ensure your PyTorch CUDA build matches your GPU (older GPUs may requir
 
 ### Load images
 - File -> Load image, or drag-and-drop.
-- Supported: `.tif/.tiff/.png/.jpg/.jpeg/.npy/.nd2/.lif/.dax/.nrrd/.flex`.
+- Supported: `.tif/.tiff/.png/.jpg/.jpeg/.bmp/.npy/.nd2/.lif/.dax/.nrrd/.flex`.
 - `.nd2`/`.lif` support is installed by default with both `pip install multicellpose` and `pip install multicellpose[gui]`.
+- **Multi-frame files** (`.nd2`, `.lif`, multi-series TIFF): navigate frames with the left/right arrow keys. Each frame is loaded on demand — large Z-stacks are not loaded into memory all at once.
+- **TIFF stack ambiguity**: when loading a TIFF whose leading dimension could be either a Z-stack or a channel stack, the GUI will prompt you to choose the interpretation. Your choice is remembered for that file path.
 
 ### Create masks
 - Right-click once to start a contour, move the cursor to trace the perimeter, then return to the start to close the loop. You do not need to hold right-click while drawing.
 - The GUI fills the contour and assigns a new instance ID.
-- Brush size: use `,` and `.` to decrease/increase.
 - Delete a single mask: `Ctrl + Left Click`.
-- Select masks: left-click on a mask or drag a rectangle to select multiple.
 - Assign a class to selected masks: `Shift + Left Click` on a mask.
+
+### Select and reposition masks
+
+**Selecting:**
+- `Left Click` on a mask — select it (highlights the mask).
+- Drag a rectangle — select all masks whose centroids fall inside the box.
+- Clicking on empty space deselects all.
+
+**Moving selected masks:**
+- `,` — move selected mask(s) one pixel to the left.
+- `.` — move selected mask(s) one pixel to the right.
+- `[` — move selected mask(s) one pixel up.
+- `]` — move selected mask(s) one pixel down.
+- Hold a key down to shift a mask smoothly across the image.
+- Movement wraps within the image bounds; masks that would extend outside are clipped.
 
 ### Create classes and assign
 - In the **Class Management** panel, enter a class name, choose a color, and click **Add**.
@@ -167,9 +182,40 @@ Critical: ensure your PyTorch CUDA build matches your GPU (older GPUs may requir
 
 ---
 
-## Analyzer (Batch Measurements)
+## 3) Multi-channel segmentation
 
-The Analyzer app is for running inference across a folder, optionally correcting masks, and exporting measurements (e.g., area and mean intensity) to CSV.
+MultiCellPose supports independent mask layers per image channel. Each channel stores its own set of masks, classes, and object IDs, all saved together in a single `.npy` file.
+
+### Per-channel masks
+
+- Use the **Inference Channel** dropdown in the Segmentation panel to select which channel to run inference on (`Auto` uses all channels; `Channel 1`, `Channel 2`, etc. runs on a single channel).
+- When you switch channels (using the **Color Mode** dropdown or navigation), the current channel's mask state is saved automatically and the new channel's masks are restored.
+- Running inference on one channel does not affect masks on other channels.
+
+### Freeze Masks `[F]`
+
+- Toggle **Freeze Masks** in the control panel (or press `F`) before running inference.
+- When enabled, inference results are merged with the existing masks rather than replacing them — the final mask set is the union of the frozen masks and any newly found objects.
+- Useful when you have manually corrected some masks and want to add new detections without overwriting your corrections.
+
+### Object IDs and cross-channel association
+
+Object IDs let you link the same biological object across multiple channels (e.g., link a nucleus mask in Channel 1 to a cell body mask in Channel 2).
+
+**Keyboard shortcuts (Association mode):**
+- `J` — enter **Association mode**. In this mode, clicking a mask selects it as the reference object.
+- `Alt + Left Click` on a mask — select a reference mask (the object you want to link *from*).
+- `Left Click` on a second mask — link the clicked mask to the selected reference, assigning them the same object ID.
+- `M` — merge selected masks into a single association group.
+- `L` — unlink / remove a mask from its association group.
+
+Object ID associations are stored alongside masks in the `.npy` file and are available to analysis plugins for cross-channel measurements.
+
+---
+
+## 4) Analyzer (Batch Measurements)
+
+The Analyzer app is for running inference across a folder, optionally correcting masks, and exporting measurements (e.g., area, mean intensity, morphology) to CSV.
 
 ### Load images
 - File -> Load image, or drag-and-drop.
@@ -192,9 +238,10 @@ The Analyzer app is for running inference across a folder, optionally correcting
 - After upload, the model will appear in the server model dropdown for inference.
 
 ### Run inference
-- Select a model and click Run.
-- For batch inference, load a directory and run; masks are saved per-image.
- - Note: inference can be slow for image sizes around `(512, 512)` or larger, especially on CPU.
+- Select a model and diameter, then click **Run Inference on Current Image** or **Run on Folder**.
+- Use the **Inference Channel** dropdown to target a specific channel or leave on `Auto`.
+- Enable **Freeze Masks** before running to merge new detections with existing masks rather than replacing them.
+- Note: inference can be slow for image sizes around `(512, 512)` or larger, especially on CPU.
 
 ### Correct masks after inference
 - Right-click once to draw a new mask (trace a closed contour). You do not need to hold right-click while drawing.
@@ -203,13 +250,43 @@ The Analyzer app is for running inference across a folder, optionally correcting
 - In Analyzer, manual edits are saved to the prediction `.npy` files by default (not the training `*_seg.npy` files).
 - Use the Masks menu to promote predicted masks into training labels when needed.
 
-### Run statistics
-- Use the Analyzer controls to compute per-object measurements (area, mean intensity, etc.).
+### Run analysis plugins
+
+Plugins compute per-object measurements on the currently loaded image and masks.
+
+**Bundled plugins:**
+- **Basic Stats** — area, centroid, mean/std intensity per channel, bounding box.
+- **Object Clusters** — spatial clustering of detected objects.
+- **Perimeter Intensity** — mean intensity along the perimeter of each mask.
+
+**Workflow (single image):**
+1. Load an image and run inference (or load existing masks).
+2. Click **Run Plugin** in the Analyzer panel.
+3. Select a plugin and configure any parameters.
+4. Results are saved immediately as a CSV next to the image file.
+   - CSV filenames include the frame ID for Z-stack / time-series images (e.g., `image__Z3_Basic_Stats.csv`).
+
+**Workflow (folder / series — with visualization review):**
+
+If the selected plugin supports a visualization overlay (e.g., a coloured region map):
+1. Click **Run Plugin** and select the plugin.
+2. The GUI generates visualization overlays for all frames/files in the background.
+3. Navigate through images using arrow keys to review and edit the overlays — draw or delete regions as needed.
+4. When satisfied, click **Finalize Plugin Analysis**.
+5. Results for all reviewed frames are concatenated and saved to CSV.
+
+**CSV output notes:**
+- One CSV is written per plugin per image (or per frame for Z-stack files).
+- Frame IDs are embedded in the filename so Z-stack frames never overwrite each other.
+- If the plugin produces per-channel intensity columns, the channel name is also included in the filename suffix.
+
+### Run statistics (legacy batch export)
+- Use the Analyzer controls to compute per-object measurements across a folder.
 - Results are saved to CSV for the full dataset.
 
 ---
 
-## 3) Remote connection (SSH + gRPC)
+## 5) Remote connection (SSH + gRPC)
 
 ### Server setup (remote machine)
 
@@ -256,7 +333,7 @@ Then in the GUI, connect to `localhost:50051`.
 
 ---
 
-## 4) Training
+## 6) Training
 
 ### Start training (Ctrl+T)
 
