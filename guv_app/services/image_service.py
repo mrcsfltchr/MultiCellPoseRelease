@@ -483,6 +483,11 @@ class ImageService:
             series_index = parsed["P"]
         time_index_only = parsed.get("T")
 
+        # If there is only one base frame the file is single-series; in that case
+        # time frame_ids should be "T0", "T1", ... (no series prefix) to match
+        # the naming used by build_frame_references and the saved seg/pred files.
+        single_series = len(base_frames) == 1
+
         frames = []
         for base_frame in base_frames:
             base_id = base_frame.frame_id
@@ -518,7 +523,7 @@ class ImageService:
                         continue
                     frame_arr = self._slice_axis(arr, axis_time, t_index)
                     frame_arr = self._normalize_channels_last(frame_arr)
-                    if base_id:
+                    if base_id and not single_series:
                         frame_id_out = f"{base_id}_T{t_index}"
                     else:
                         frame_id_out = f"T{t_index}"
