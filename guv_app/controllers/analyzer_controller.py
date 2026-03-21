@@ -407,6 +407,13 @@ class AnalyzerController(MainController):
             return
         base_file = self.model.filename
         series_index = getattr(self.model, "series_index", None)
+        if base_file:
+            try:
+                _, series_count, time_count = self.image_service.get_series_time_info(base_file)
+                if series_count > 1 and time_count <= 1:
+                    series_index = None  # positions-only file: iterate all positions
+            except Exception:
+                pass
         plugin = selected_plugins[0]
         if self._plugin_supports_visualization(plugin):
             self.active_plugin = plugin
