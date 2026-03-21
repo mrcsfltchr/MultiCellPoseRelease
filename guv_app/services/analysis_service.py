@@ -9,6 +9,7 @@ import sys
 from typing import List, Dict
 from guv_app.plugins.interface import AnalysisPlugin
 import guv_app.plugins
+from cellpose import io as _cellpose_io
 
 _logger = logging.getLogger(__name__)
 
@@ -183,22 +184,23 @@ class AnalysisService:
         # 3. Execute
         return plugin.visualize(image, masks, classes=classes, **params)
 
-    def save_results(self, results: Dict[str, pd.DataFrame], filename: str) -> List[str]:
+    def save_results(self, results: Dict[str, pd.DataFrame], filename: str, frame_id: str = None) -> List[str]:
         """
         Saves analysis results to CSV files.
         """
         saved_files = []
         if not filename:
             return saved_files
-        
+
         base = os.path.splitext(filename)[0]
-        
+        frame_suffix = _cellpose_io.frame_id_to_suffix(frame_id)
+
         for plugin_name, df in results.items():
             if df is not None and not df.empty:
                 # Sanitize plugin name for filename
                 safe_name = "".join(x for x in plugin_name if x.isalnum() or x in "._- ").replace(" ", "_")
                 suffix = _csv_suffix_from_df(df)
-                csv_path = f"{base}_{safe_name}{suffix}.csv"
+                csv_path = f"{base}{frame_suffix}_{safe_name}{suffix}.csv"
                 try:
                     df.to_csv(csv_path, index=False)
                     saved_files.append(csv_path)

@@ -254,6 +254,34 @@ class AnalyzerController(MainController):
         except AttributeError:
             return False
 
+    def _get_analysis_image(self):
+        """Return the pre-normalization image for intensity measurements.
+
+        Priority: source_image (original pixel values) > raw_image
+        (normalize99-processed) > image_data.  Using the pre-normalization
+        image ensures that per-channel intensity values reflect actual
+        fluorescence levels rather than globally-normalised ones.
+        """
+        if getattr(self.model, "source_image", None) is not None:
+            return self.model.source_image
+        if getattr(self.model, "raw_image", None) is not None:
+            return self.model.raw_image
+        return self.model.image_data
+
+    def _augment_plugin_params_for_current_model(self, plugin_params, plugins):
+        params = {name: dict(values) for name, values in (plugin_params or {}).items()}
+        channel_index = int(self.model.get_current_channel_index())
+        object_ids = self.model.get_object_ids_for_channel(channel_index)
+        channel_segmentations = getattr(self.model, "channel_segmentations", None)
+        for plugin in plugins or []:
+            name = plugin.name
+            if name not in params:
+                params[name] = {}
+            params[name].setdefault("channel_index", channel_index)
+            params[name].setdefault("object_ids_by_mask", object_ids)
+            params[name].setdefault("channel_segmentations", channel_segmentations)
+        return params
+
     def _start_statistics_worker(self, folder_path, plugins, plugin_params, visualization_masks_by_file, series_index=None,
                                  visualize_only=False, image_files=None):
         self.worker = StatisticsWorker(
@@ -284,10 +312,11 @@ class AnalyzerController(MainController):
         """
         Runs a selected plugin on the currently loaded image and updates the view with the result.
         """
-        if self.model.image_data is None:
+        analysis_image = self._get_analysis_image()
+        if analysis_image is None:
             self.view.show_progress("No image loaded.")
             return
-            
+
         if self.model.masks is None:
             self.view.show_progress("No masks available on current image.")
             return
@@ -297,6 +326,8 @@ class AnalyzerController(MainController):
             self.analysis_service = AnalysisService()
         else:
             self.analysis_service.discover_plugins(reload_modules=True)
+        names = ", ".join(sorted(self.analysis_service.plugins.keys()))
+        self.view.show_progress(f"Discovered plugins: {names}" if names else "Discovered plugins: <none>")
 
         # 1. Select Plugin
         selected_plugins, plugin_params = self.view.prompt_plugin_configuration(self.analysis_service.plugins)
@@ -306,6 +337,7 @@ class AnalyzerController(MainController):
         # For visualization, we typically only want to visualize one result at a time.
         # We'll take the first selected plugin.
         plugin = selected_plugins[0]
+        plugin_params = self._augment_plugin_params_for_current_model(plugin_params, [plugin])
         params = plugin_params.get(plugin.name, {})
         self.active_plugin = plugin
         self.active_plugin_params = params
@@ -316,17 +348,17 @@ class AnalyzerController(MainController):
         try:
             # Use service to handle defaults and execution
             results = self.analysis_service.run_analysis(
-                self.model.image_data, 
-                self.model.masks, 
+                analysis_image,
+                self.model.masks,
                 classes=self.model.classes,
                 filename=os.path.basename(self.model.filename) if self.model.filename else None,
                 plugins=[plugin],
                 plugin_params={plugin.name: params}
             )
-            
+
             # Save results using the service
             if self.model.filename:
-                saved_files = self.analysis_service.save_results(results, self.model.filename)
+                saved_files = self.analysis_service.save_results(results, self.model.filename, frame_id=self.model.frame_id)
                 for path in saved_files:
                     self.view.show_progress(f"Saved results to {os.path.basename(path)}")
             else:
@@ -338,7 +370,7 @@ class AnalyzerController(MainController):
         # 3. Run Visualization
         try:
             viz_mask = self.analysis_service.run_visualization(
-                plugin, self.model.image_data, self.model.masks, 
+                plugin, analysis_image, self.model.masks,
                 classes=self.model.classes, plugin_params=params
             )
             
@@ -555,7 +587,8 @@ class AnalyzerController(MainController):
             )
             return
 
-        if self.model.image_data is None:
+        analysis_image = self._get_analysis_image()
+        if analysis_image is None:
             self.view.show_progress("No image loaded.")
             return
 
@@ -577,6 +610,7 @@ class AnalyzerController(MainController):
             if not selected_plugins:
                 return
             plugin = selected_plugins[0]
+            plugin_params = self._augment_plugin_params_for_current_model(plugin_params, [plugin])
             params = plugin_params.get(plugin.name, {})
             self.active_plugin = plugin
             self.active_plugin_params = params
@@ -586,7 +620,7 @@ class AnalyzerController(MainController):
 
         try:
             results = self.analysis_service.run_analysis(
-                self.model.image_data,
+                analysis_image,
                 self.model.masks,
                 classes=self.model.classes,
                 filename=os.path.basename(self.model.filename) if self.model.filename else None,
@@ -595,7 +629,7 @@ class AnalyzerController(MainController):
             )
 
             if self.model.filename:
-                saved_files = self.analysis_service.save_results(results, self.model.filename)
+                saved_files = self.analysis_service.save_results(results, self.model.filename, frame_id=self.model.frame_id)
                 for path in saved_files:
                     self.view.show_progress(f"Saved results to {os.path.basename(path)}")
                 if hasattr(self.view, "set_plugin_hint_visible"):

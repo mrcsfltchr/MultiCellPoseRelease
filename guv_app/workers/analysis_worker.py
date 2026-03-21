@@ -68,7 +68,8 @@ class AnalysisWorker(BaseWorker):
                             frame_id=frame_id,
                             diameter=self.diameter,
                             classes=classes,
-                            classes_map=classes_map
+                            classes_map=classes_map,
+                            channel_index=self.channel_index,
                         )
                         self.result_ready.emit(result)
                     continue
@@ -97,7 +98,8 @@ class AnalysisWorker(BaseWorker):
                         frame_id=frame.frame_id,
                         diameter=self.diameter,
                         classes=classes,
-                        classes_map=classes_map
+                        classes_map=classes_map,
+                        channel_index=self.channel_index,
                     )
                     self.result_ready.emit(result)
 

@@ -59,11 +59,19 @@ class ControlPanel(QScrollArea):
         self.autosave_checkbox.setChecked(True)
         self.layout.addWidget(self.autosave_checkbox, 2, 0, 1, 2)
 
+        self.freeze_masks_checkbox = QCheckBox("Freeze Masks  [F]")
+        self.freeze_masks_checkbox.setChecked(False)
+        self.freeze_masks_checkbox.setToolTip(
+            "When enabled, running inference adds new masks without removing existing ones "
+            "(union of frozen + newly found masks). Shortcut: F"
+        )
+        self.layout.addWidget(self.freeze_masks_checkbox, 3, 0, 1, 2)
+
         # --- Class Management ---
         class_box = QGroupBox("Class Management")
         class_layout = QGridLayout()
         class_box.setLayout(class_layout)
-        self.layout.addWidget(class_box, 3, 0, 1, 2)
+        self.layout.addWidget(class_box, 4, 0, 1, 2)
 
         class_layout.addWidget(QLabel("Current Class:"), 0, 0)
         self.class_dropdown = QComboBox()
@@ -108,7 +116,7 @@ class ControlPanel(QScrollArea):
         view_box = QGroupBox("View Options")
         view_layout = QGridLayout()
         view_box.setLayout(view_layout)
-        self.layout.addWidget(view_box, 4, 0, 1, 2)
+        self.layout.addWidget(view_box, 5, 0, 1, 2)
 
         view_layout.addWidget(QLabel("View Mode:"), 0, 0)
         self.view_mode_dropdown = QComboBox()
@@ -133,7 +141,7 @@ class ControlPanel(QScrollArea):
             levels_box = QGroupBox("Image Levels")
             levels_layout = QVBoxLayout()
             levels_box.setLayout(levels_layout)
-            self.layout.addWidget(levels_box, 5, 0, 1, 2)
+            self.layout.addWidget(levels_box, 6, 0, 1, 2)
             
             self.sliders = []
             self.slider_labels = []
@@ -151,7 +159,7 @@ class ControlPanel(QScrollArea):
         seg_box = QGroupBox("Segmentation")
         seg_layout = QGridLayout()
         seg_box.setLayout(seg_layout)
-        self.layout.addWidget(seg_box, 6, 0, 1, 2)
+        self.layout.addWidget(seg_box, 7, 0, 1, 2)
 
         seg_layout.addWidget(QLabel("Model:"), 0, 0)
         self.model_dropdown = QComboBox()

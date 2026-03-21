@@ -17,6 +17,7 @@ class InferenceResult:
     class_colors: Optional[np.ndarray] = None
     outlines: Optional[np.ndarray] = None
     diameter: Optional[float] = None
+    channel_index: Optional[int] = None
 
 
 @dataclass

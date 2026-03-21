@@ -463,21 +463,6 @@ def imread(filename, return_first_tile=True, save_tiles=True):
             dat = np.load(filename, allow_pickle=True).item()
             masks = dat["masks"]
             return masks
-        except ModuleNotFoundError as e:
-            if "numpy._core" in str(e):
-                import numpy.core as _np_core
-                sys.modules.setdefault("numpy._core", _np_core)
-                sys.modules.setdefault("numpy._core.multiarray", _np_core.multiarray)
-                sys.modules.setdefault("numpy._core.numeric", _np_core.numeric)
-                try:
-                    dat = np.load(filename, allow_pickle=True).item()
-                    masks = dat["masks"]
-                    return masks
-                except Exception as e2:
-                    io_logger.critical("ERROR: could not read masks from file, %s" % e2)
-                    return None
-            io_logger.critical("ERROR: could not read masks from file, %s" % e)
-            return None
         except Exception as e:
             io_logger.critical("ERROR: could not read masks from file, %s" % e)
             return None
@@ -509,12 +494,62 @@ class _TiffReader(ImageReader):
         except Exception:
             return False
 
-    def _normalize_axes(self, series, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
+    def _metadata_stack_axis_override(self, tif, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
+        if axes != "ZYX" or len(shape) != 3:
+            return None
+
+        try:
+            imagej_meta = getattr(tif, "imagej_metadata", None) or {}
+        except Exception:
+            imagej_meta = {}
+        if isinstance(imagej_meta, dict):
+            channels = int(imagej_meta.get("channels", 1) or 1)
+            slices = int(imagej_meta.get("slices", 1) or 1)
+            frames = int(imagej_meta.get("frames", 1) or 1)
+            if channels > 1 and slices <= 1 and frames <= 1 and int(shape[0]) == channels:
+                return "CYX"
+
+        try:
+            ome_xml = getattr(tif, "ome_metadata", None)
+        except Exception:
+            ome_xml = None
+        if isinstance(ome_xml, str):
+            size_c = re.search(r'SizeC="(\d+)"', ome_xml)
+            size_z = re.search(r'SizeZ="(\d+)"', ome_xml)
+            size_t = re.search(r'SizeT="(\d+)"', ome_xml)
+            dim_order = re.search(r'DimensionOrder="([A-Z]+)"', ome_xml)
+            c_val = int(size_c.group(1)) if size_c else 1
+            z_val = int(size_z.group(1)) if size_z else 1
+            t_val = int(size_t.group(1)) if size_t else 1
+            order = dim_order.group(1) if dim_order else None
+            if c_val > 1 and z_val <= 1 and t_val <= 1 and int(shape[0]) == c_val:
+                return "CYX"
+            if z_val > 1 and c_val <= 1 and t_val <= 1 and int(shape[0]) == z_val:
+                return "ZYX"
+            if order == "XYZCT" and c_val > 1 and z_val <= 1 and int(shape[0]) == c_val:
+                return "CYX"
+
+        return None
+
+    def _normalize_axes(self, tif, series, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
         if not isinstance(axes, str):
             return None
         if self._is_rgb_samples_axis(series, axes, shape):
             # TIFF RGB is often YXS; treat S as channel axis, not series axis.
             return axes.replace("S", "C")
+        axes_override = self._metadata_stack_axis_override(tif, axes, shape)
+        if axes_override is not None:
+            return axes_override
+        if (
+            axes == "ZYX"
+            and len(shape) == 3
+            and int(shape[0]) <= 8
+            and int(shape[1]) > 8
+            and int(shape[2]) > 8
+        ):
+            # Many fluorescence TIFFs are stored as plane stacks but semantically the
+            # leading plane axis is the channel dimension, not optical depth.
+            return "CYX"
         return axes
 
     def read(self, filename: str) -> ImageData:
@@ -522,7 +557,12 @@ class _TiffReader(ImageReader):
             series = tif.series[0]
             axes = getattr(series, "axes", None)
             arr = series.asarray()
-        axes = self._normalize_axes(series, axes, tuple(arr.shape))
+            axes = self._normalize_axes(tif, series, axes, tuple(arr.shape))
+        if axes and "C" in axes:
+            c_idx = axes.index("C")
+            if c_idx != len(axes) - 1:
+                arr = np.moveaxis(arr, c_idx, -1)
+                axes = axes.replace("C", "") + "C"
         meta = ImageMeta(
             axes=axes,
             shape=tuple(arr.shape),
@@ -547,7 +587,7 @@ class _TiffReader(ImageReader):
                     dtype=arr.dtype,
                 )
                 return ImageFrame(_normalize_channels_last(arr), meta, None)
-            axes = self._normalize_axes(series, axes, tuple(series.shape))
+            axes = self._normalize_axes(tif, series, axes, tuple(series.shape))
 
             parsed = parse_frame_id(frame_id)
             key = []
@@ -564,6 +604,10 @@ class _TiffReader(ImageReader):
                 arr = series.asarray(key=key_tuple)
             except Exception:
                 arr = series.asarray()[key_tuple]
+            if "C" in axes:
+                c_idx = axes.index("C")
+                if c_idx != arr.ndim - 1:
+                    arr = np.moveaxis(arr, c_idx, -1)
             arr = _normalize_channels_last(arr)
             new_axes = "".join(
                 [ax for ax, k in zip(axes, key) if not isinstance(k, int)]
@@ -581,7 +625,7 @@ class _TiffReader(ImageReader):
             series = tif.series[0]
             axes = getattr(series, "axes", None)
             shape = tuple(getattr(series, "shape", ()))
-            axes = self._normalize_axes(series, axes, shape)
+            axes = self._normalize_axes(tif, series, axes, shape)
             sizes = _sizes_from_axes(axes, shape)
         series_key = "S" if sizes.get("S", 1) > 1 else "P" if sizes.get("P", 1) > 1 else None
         series_count = int(sizes.get(series_key, 1)) if series_key else 1
@@ -593,7 +637,7 @@ class _TiffReader(ImageReader):
             series = tif.series[0]
             axes = getattr(series, "axes", None)
             shape = tuple(getattr(series, "shape", ()))
-            axes = self._normalize_axes(series, axes, shape)
+            axes = self._normalize_axes(tif, series, axes, shape)
             sizes = _sizes_from_axes(axes, shape)
         return int(sizes.get("Z", 1))
 
@@ -1000,28 +1044,30 @@ class _LifReader(ImageReader):
             except Exception:
                 c_count = 0
             if c_count > 0:
-                # Modern readlif: get_frame(z, t, c)
+                # Modern readlif (>= 0.6): get_frame accepts z, t, c kwargs
                 try:
                     chans = [
                         np.asarray(img_info.get_frame(z=z_val, t=t_val, c=int(c_idx)))
                         for c_idx in range(c_count)
                     ]
-                    return np.stack(chans, axis=-1)
+                    return np.stack(chans, axis=-1) if len(chans) > 1 else chans[0]
                 except TypeError:
                     pass
-                # Intermediate readlif: get_frame(t, c)
+                # Intermediate readlif: get_frame accepts t, c but not z (z=0 implied)
                 try:
                     chans = [
                         np.asarray(img_info.get_frame(t=t_val, c=int(c_idx)))
                         for c_idx in range(c_count)
                     ]
-                    return np.stack(chans, axis=-1)
+                    return np.stack(chans, axis=-1) if len(chans) > 1 else chans[0]
                 except TypeError:
                     pass
+        # T-iteration fallback (older readlif without get_frame kwargs)
         if time_index is not None and hasattr(img_info, "get_iter_t"):
             for idx, frame in enumerate(img_info.get_iter_t()):
                 if idx == t_val:
                     return np.asarray(frame)
+        # Channel-only fallback: z=0, t=0
         if hasattr(img_info, "get_iter_c"):
             chans = [np.asarray(p) for p in img_info.get_iter_c()]
             return np.stack(chans, axis=-1) if len(chans) > 1 else (chans[0] if chans else None)
@@ -1557,7 +1603,7 @@ def get_image_files(folder, mask_filter, imf=None, look_one_level_down=False):
     if look_one_level_down:
         folders = natsorted(glob.glob(os.path.join(folder, "*/")))
     folders.append(folder)
-    exts = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".flex", ".dax", ".nd2", ".lif", ".nrrd"]
+    exts = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".flex", ".dax", ".nd2", ".lif", ".nrrd"]
     l0 = 0
     al = 0
     for folder in folders:

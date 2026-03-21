@@ -407,6 +407,27 @@ class MainController(QObject):
         self.handle_level_change(0, 0)
         self._autoload_masks(filename)
 
+    @staticmethod
+    def _repair_channel_seg_colors(channel_segmentations):
+        """Ensures every channel slot with masks has non-zero (visible) instance_colors.
+
+        Repairs files that were saved while instance_colors was still all-zeros
+        (black), which makes mask overlays invisible in the view.
+        """
+        for slot_state in (channel_segmentations or {}).values():
+            if not isinstance(slot_state, dict):
+                continue
+            slot_masks = slot_state.get("masks")
+            if slot_masks is None:
+                continue
+            n = int(np.asarray(slot_masks).max())
+            if n > 0:
+                colors = slot_state.get("instance_colors")
+                if colors is None or not np.any(np.asarray(colors)):
+                    slot_state["instance_colors"] = np.random.randint(
+                        0, 255, (n + 1, 3), dtype=np.uint8
+                    )
+
     def _autoload_masks(self, filename):
         """
         Automatically loads masks from files based on priority if they exist.
