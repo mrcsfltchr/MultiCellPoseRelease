@@ -115,9 +115,8 @@ class AnalyzerController(MainController):
         if not folder_path or not os.path.isdir(folder_path):
             self.view.show_progress("Invalid folder path.")
             return
-        series_index, cancelled = self._prompt_series_for_folder(folder_path)
-        if cancelled:
-            return
+        # Always process all frames in each multi-image file (series_index=None)
+        series_index = None
 
         if self.analysis_service is None:
             self.analysis_service = AnalysisService()
@@ -226,6 +225,8 @@ class AnalyzerController(MainController):
             self.model.filename,
             self.model.frame_id,
             plugin_name=plugin_name,
+            reference_masks=self.model.masks,
+            require_same_label=plugin_name == "Condensate Droplet Analysis",
         )
         if stored is not None:
             self.model.set_visualization(stored)
@@ -475,7 +476,9 @@ class AnalyzerController(MainController):
                 return
             combined = {}
             for frame in frames:
-                image = frame.array
+                image = self.image_service.load_frame(base_file, frame.frame_id)
+                if image is None:
+                    image = frame.array
                 if image is None:
                     continue
                 base = os.path.splitext(base_file)[0]
@@ -494,10 +497,15 @@ class AnalyzerController(MainController):
                     classes = dat.get("classes")
                 if masks is None:
                     continue
+                image = _align_image_to_masks(image, masks)
+                if image is None:
+                    continue
                 viz_mask = self.image_service.load_visualization_mask(
                     base_file,
                     frame.frame_id,
                     plugin_name=plugin.name,
+                    reference_masks=masks,
+                    require_same_label=plugin.name == "Condensate Droplet Analysis",
                 )
                 if viz_mask is not None:
                     plugin_params[plugin.name]["visualization_masks"] = viz_mask
@@ -558,9 +566,6 @@ class AnalyzerController(MainController):
             self.pending_series_index = None
             return
         if self.pending_folder_path:
-            if self.model.visualization_masks is None:
-                self.view.show_progress("No plugin visualization mask to finalize.")
-                return
             if self.active_plugin is None:
                 self.view.show_progress("No active plugin selected.")
                 return
@@ -568,20 +573,19 @@ class AnalyzerController(MainController):
             folder_path = self.pending_folder_path
             plugin = self.active_plugin
             plugin_params = dict(self.pending_folder_plugin_params or {})
+            series_index = self.pending_series_index
 
-            if not self.model.filename:
-                self.view.show_progress("No current filename to apply visualization override.")
-                return
-
+            # Persist any edits to the currently displayed visualization before
+            # the worker consumes the folder-wide saved visualization masks.
             self._store_visualization_for_current_file()
+
             visualization_masks_by_file = {}
             for key, mask in self.visualization_masks_by_file.items():
                 visualization_masks_by_file[key] = {plugin.name: mask}
+
             self.pending_folder_path = None
             self.pending_folder_plugin_params = None
-            series_index = self.pending_series_index
             self.pending_series_index = None
-
             if hasattr(self.view, "set_plugin_hint_visible"):
                 self.view.set_plugin_hint_visible(False)
 
@@ -591,6 +595,9 @@ class AnalyzerController(MainController):
                 plugin_params=plugin_params,
                 visualization_masks_by_file=visualization_masks_by_file,
                 series_index=series_index,
+            )
+            self.view.show_progress(
+                f"Finalizing {plugin.name} analysis for all images in folder."
             )
             return
 
@@ -698,3 +705,19 @@ class AnalyzerController(MainController):
         super().handle_delete_mask(y, x)
         if (self.pending_folder_path or self.pending_series_file) and self.model.visualization_masks is not None:
             self._store_visualization_for_current_file()
+
+
+def _align_image_to_masks(image, masks):
+    if image is None or masks is None:
+        return image
+    img = np.asarray(image)
+    mask_shape = np.squeeze(np.asarray(masks)).shape
+    if len(mask_shape) > 2:
+        mask_shape = mask_shape[-2:]
+    if img.ndim >= 2 and tuple(img.shape[:2]) == tuple(mask_shape):
+        return image
+    if img.ndim == 3 and tuple(img.shape[1:]) == tuple(mask_shape):
+        return np.moveaxis(img, 0, -1)
+    if img.ndim >= 2 and tuple(img.shape[-2:]) == tuple(mask_shape):
+        return image
+    return None

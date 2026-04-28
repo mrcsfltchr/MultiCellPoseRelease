@@ -97,7 +97,9 @@ class StatisticsWorker(BaseWorker):
                             frame_label = f"{frame_label}::{frame.frame_id}"
                         _logger.info("Plugin analysis: start frame %s", frame_label)
                         t_start = time.time()
-                        image = frame.array
+                        image = self.image_service.load_frame(filename, frame.frame_id)
+                        if image is None:
+                            image = frame.array
                         if image is None:
                             continue
 
@@ -122,6 +124,15 @@ class StatisticsWorker(BaseWorker):
                         if masks is None:
                             continue
 
+                        image = _align_image_to_masks(image, masks)
+                        if image is None:
+                            _logger.warning(
+                                "Skipping %s: image shape does not align with mask shape %s",
+                                frame_label,
+                                np.asarray(masks).shape,
+                            )
+                            continue
+
                         plugin_params = self._augment_plugin_params(self.plugin_params, dat or {}, masks)
                         if self.visualization_masks_by_file is not None:
                             ref = filename
@@ -137,7 +148,11 @@ class StatisticsWorker(BaseWorker):
                                     # Try loading a previously-saved visualization mask from disk
                                     # before regenerating (covers finalize-after-navigate workflows)
                                     viz_mask = self.image_service.load_visualization_mask(
-                                        filename, frame.frame_id, plugin_name=name
+                                        filename,
+                                        frame.frame_id,
+                                        plugin_name=name,
+                                        reference_masks=masks,
+                                        require_same_label=name == "Condensate Droplet Analysis",
                                     )
                                 if viz_mask is None and self._plugin_supports_visualization(plugin):
                                     viz_mask = self.analysis_service.run_visualization(
@@ -266,3 +281,19 @@ def _channel_suffix_from_df(df):
         if val:
             return f"_{val}"
     return "_multi_channel" if values else ""
+
+
+def _align_image_to_masks(image, masks):
+    if image is None or masks is None:
+        return image
+    img = np.asarray(image)
+    mask_shape = np.squeeze(np.asarray(masks)).shape
+    if len(mask_shape) > 2:
+        mask_shape = mask_shape[-2:]
+    if img.ndim >= 2 and tuple(img.shape[:2]) == tuple(mask_shape):
+        return image
+    if img.ndim == 3 and tuple(img.shape[1:]) == tuple(mask_shape):
+        return np.moveaxis(img, 0, -1)
+    if img.ndim >= 2 and tuple(img.shape[-2:]) == tuple(mask_shape):
+        return image
+    return None

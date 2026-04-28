@@ -534,6 +534,12 @@ class _TiffReader(ImageReader):
     def _normalize_axes(self, tif, series, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
         if not isinstance(axes, str):
             return None
+        if "I" in axes:
+            # tifffile uses I for a generic sequence of image pages.  In
+            # microscopy TIFFs this is a frame/position axis, not a channel
+            # axis.  Normalize it to P so frame navigation and display slicing
+            # treat pages as separate grayscale images.
+            axes = axes.replace("I", "P")
         if self._is_rgb_samples_axis(series, axes, shape):
             # TIFF RGB is often YXS; treat S as channel axis, not series axis.
             return axes.replace("S", "C")

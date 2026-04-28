@@ -26,7 +26,31 @@ class BasicStatsPlugin(AnalysisPlugin):
                     "mean_intensity_ch1, mean_intensity_ch2, ... columns. "
                     "1/2/3 selects a specific channel only."
                 ),
-            }
+            },
+            "background_inner_gap_px": {
+                "type": "int",
+                "default": 2,
+                "min": 0,
+                "max": 50,
+                "label": "Background Gap (px)",
+                "help": "Pixels to skip between each mask and its local background annulus.",
+            },
+            "background_outer_radius_px": {
+                "type": "int",
+                "default": 12,
+                "min": 1,
+                "max": 200,
+                "label": "Background Radius (px)",
+                "help": "Outer radius of each local background annulus.",
+            },
+            "background_percentile": {
+                "type": "float",
+                "default": 25.0,
+                "min": 0.0,
+                "max": 100.0,
+                "label": "Background Percentile",
+                "help": "Robust percentile used as the local background level.",
+            },
         }
 
     def run(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> pd.DataFrame:
@@ -36,6 +60,12 @@ class BasicStatsPlugin(AnalysisPlugin):
             return pd.DataFrame()
 
         intensity_channel = _parse_intensity_channel(kwargs.get("intensity_channel", "all"))
+        bg_inner_gap = max(0, int(kwargs.get("background_inner_gap_px", 2)))
+        bg_outer_radius = max(1, int(kwargs.get("background_outer_radius_px", 12)))
+        bg_percentile = float(kwargs.get("background_percentile", 25.0))
+        bg_percentile = min(100.0, max(0.0, bg_percentile))
+        if bg_outer_radius <= bg_inner_gap:
+            bg_outer_radius = bg_inner_gap + 1
 
         # Squeeze masks to 2D for consistent morphology + intensity computation
         labels = np.squeeze(np.asarray(masks)).astype(np.int32, copy=False)
@@ -66,6 +96,7 @@ class BasicStatsPlugin(AnalysisPlugin):
             "area": area[1:],
             "perimeter": perimeter[1:],
         })
+        bg_labels = _make_local_background_labels(labels, bg_inner_gap, bg_outer_radius)
 
         # ── Intensity ────────────────────────────────────────────────────────
         if intensity_channel == -1:
@@ -74,10 +105,22 @@ class BasicStatsPlugin(AnalysisPlugin):
                 image, labels, flat_labels, area, nonzero, max_label
             )
             if per_channel is not None and len(per_channel) > 1:
+                channel_slices = _extract_channel_slices(image, labels)
                 overall = np.mean(np.stack(per_channel, axis=0), axis=0)
                 df["mean_intensity"] = overall
+                bg_sub_channels = []
                 for c_idx, ch_means in enumerate(per_channel):
                     df[f"mean_intensity_ch{c_idx + 1}"] = ch_means
+                    if channel_slices[c_idx] is None:
+                        bg_values = np.full(mask_ids.shape, np.nan, dtype=np.float64)
+                    else:
+                        bg_values = _local_background_values(
+                            bg_labels, channel_slices[c_idx], mask_ids, bg_percentile
+                        )
+                    bg_sub = ch_means - bg_values
+                    bg_sub_channels.append(bg_sub)
+                    df[f"mean_intensity_bg_subtracted_ch{c_idx + 1}"] = bg_sub
+                df["mean_intensity_bg_subtracted"] = _nanmean_columns(bg_sub_channels)
             else:
                 # Single-channel image or indeterminate axes — produce one column
                 try:
@@ -87,6 +130,10 @@ class BasicStatsPlugin(AnalysisPlugin):
                     mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
                     mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
                     df["mean_intensity"] = mean_intensity[1:]
+                    bg_values = _local_background_values(
+                        bg_labels, np.squeeze(intensity_img), mask_ids, bg_percentile
+                    )
+                    df["mean_intensity_bg_subtracted"] = mean_intensity[1:] - bg_values
                 except ValueError as exc:
                     _logger.warning("Basic Stats: %s", exc)
                     return pd.DataFrame()
@@ -103,6 +150,10 @@ class BasicStatsPlugin(AnalysisPlugin):
             mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
             mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
             df["mean_intensity"] = mean_intensity[1:]
+            bg_values = _local_background_values(
+                bg_labels, np.squeeze(intensity_img), mask_ids, bg_percentile
+            )
+            df["mean_intensity_bg_subtracted"] = mean_intensity[1:] - bg_values
             df["intensity_channel_name"] = channel_name
 
         # ── Object ID assignment ─────────────────────────────────────────────
@@ -143,6 +194,38 @@ def _ravel_to_match(intensity_img: np.ndarray, labels_2d: np.ndarray) -> np.ndar
     raise ValueError(
         f"Cannot align intensity shape {intensity_img.shape} with labels shape {labels_2d.shape}"
     )
+
+
+def _extract_channel_slices(image, labels_2d):
+    """
+    Return per-channel 2D arrays matching labels_2d, or None for single-channel
+    or ambiguous image layouts.
+    """
+    arr = np.squeeze(np.asarray(image))
+    if arr.ndim < 3:
+        return None
+
+    if arr.shape[-1] <= 8 and arr.shape[0] > 8 and arr.shape[1] > 8:
+        channel_slices = [arr[..., c] for c in range(arr.shape[-1])]
+    elif arr.shape[0] <= 8 and arr.shape[1] > 8 and arr.shape[2] > 8:
+        channel_slices = [arr[c] for c in range(arr.shape[0])]
+    else:
+        return None
+
+    if len(channel_slices) < 2:
+        return None
+
+    aligned = []
+    for ch_arr in channel_slices:
+        ch_2d = np.squeeze(ch_arr).astype(np.float64)
+        if ch_2d.shape != labels_2d.shape:
+            if ch_2d.size == labels_2d.size:
+                ch_2d = ch_2d.reshape(labels_2d.shape)
+            else:
+                aligned.append(None)
+                continue
+        aligned.append(ch_2d)
+    return aligned
 
 
 def _compute_per_channel_means(image, labels_2d, flat_labels, area, nonzero, max_label):
@@ -188,6 +271,79 @@ def _compute_per_channel_means(image, labels_2d, flat_labels, area, nonzero, max
         per_channel.append(ch_mean[1:])
 
     return per_channel
+
+
+def _make_local_background_labels(
+    labels_2d: np.ndarray,
+    inner_gap_px: int,
+    outer_radius_px: int,
+) -> np.ndarray:
+    """
+    Label local background pixels by nearest object.
+
+    Only unlabeled pixels are eligible, so the annulus cannot include any
+    segmented object. The distance-transform nearest-label assignment gives
+    each object its local background ring.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    labels = np.asarray(labels_2d, dtype=np.int32)
+    bg_dist, nearest_idx = distance_transform_edt(labels == 0, return_indices=True)
+    nearest_labels = labels[tuple(nearest_idx)]
+    annulus = (labels == 0) & (bg_dist > inner_gap_px) & (bg_dist <= outer_radius_px)
+    return (nearest_labels * annulus).astype(np.int32, copy=False)
+
+
+def _local_background_values(
+    background_labels: np.ndarray,
+    channel_img: np.ndarray,
+    mask_ids: np.ndarray,
+    percentile: float,
+) -> np.ndarray:
+    """Return one robust local background value per mask id."""
+    ch = np.squeeze(np.asarray(channel_img, dtype=np.float64))
+    if ch.shape != background_labels.shape:
+        if ch.size == background_labels.size:
+            ch = ch.reshape(background_labels.shape)
+        else:
+            raise ValueError(
+                f"Cannot align background channel shape {channel_img.shape} "
+                f"with labels shape {background_labels.shape}"
+            )
+
+    bg_flat = background_labels.ravel()
+    values_flat = ch.ravel()
+    usable = (bg_flat > 0) & np.isfinite(values_flat)
+    out = np.full(mask_ids.shape, np.nan, dtype=np.float64)
+    if not usable.any():
+        return out
+
+    sample_labels = bg_flat[usable]
+    sample_values = values_flat[usable]
+    order = np.argsort(sample_labels, kind="stable")
+    sample_labels = sample_labels[order]
+    sample_values = sample_values[order]
+
+    starts = np.r_[0, np.flatnonzero(np.diff(sample_labels)) + 1]
+    ends = np.r_[starts[1:], sample_labels.size]
+    id_to_pos = {int(mask_id): pos for pos, mask_id in enumerate(mask_ids)}
+    for start, end in zip(starts, ends):
+        label_id = int(sample_labels[start])
+        pos = id_to_pos.get(label_id)
+        if pos is not None:
+            out[pos] = np.percentile(sample_values[start:end], percentile)
+    return out
+
+
+def _nanmean_columns(values) -> np.ndarray:
+    """Mean across arrays, preserving NaN where every input is NaN."""
+    stack = np.stack(values, axis=0)
+    valid = np.isfinite(stack)
+    counts = valid.sum(axis=0)
+    out = np.full(stack.shape[1], np.nan, dtype=np.float64)
+    has_value = counts > 0
+    out[has_value] = np.nansum(stack[:, has_value], axis=0) / counts[has_value]
+    return out
 
 
 def _match_intensity_to_masks(

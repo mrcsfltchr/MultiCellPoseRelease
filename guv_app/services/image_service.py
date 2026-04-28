@@ -161,7 +161,7 @@ class ImageService:
 
         # For display we only need one slice from series/time/depth-like axes.
         if axes:
-            for axis_name in ("S", "P", "T", "Z"):
+            for axis_name in ("S", "P", "I", "T", "Z"):
                 while axis_name in axes:
                     idx = axes.index(axis_name)
                     arr = np.take(arr, 0, axis=idx)
@@ -1160,7 +1160,12 @@ class ImageService:
         if not filename or masks is None:
             return None
         out_path = self.build_frame_path(filename, frame_id, "_viz.npy")
-        payload = {"masks": masks}
+        masks_arr = np.asarray(masks)
+        payload = {
+            "masks": masks_arr,
+            "shape": tuple(masks_arr.shape),
+            "max_label": int(masks_arr.max()) if masks_arr.size else 0,
+        }
         if plugin_name:
             payload["plugin"] = plugin_name
         try:
@@ -1170,7 +1175,14 @@ class ImageService:
             _logger.error(f"Failed to save visualization mask: {e}")
             return None
 
-    def load_visualization_mask(self, filename, frame_id, plugin_name=None):
+    def load_visualization_mask(
+        self,
+        filename,
+        frame_id,
+        plugin_name=None,
+        reference_masks=None,
+        require_same_label=False,
+    ):
         if not filename:
             return None
         path = self.build_frame_path(filename, frame_id, "_viz.npy")
@@ -1180,7 +1192,38 @@ class ImageService:
             dat = np.load(path, allow_pickle=True).item()
             if plugin_name and dat.get("plugin") not in (None, plugin_name):
                 return None
-            return dat.get("masks")
+            masks = dat.get("masks")
+            if masks is None:
+                return None
+            masks = np.asarray(masks)
+            if reference_masks is not None and not _visualization_matches_reference(
+                masks,
+                reference_masks,
+                require_same_label=require_same_label,
+            ):
+                _logger.warning(
+                    "Ignoring stale visualization mask %s: it does not match current masks.",
+                    path,
+                )
+                return None
+            return masks
         except Exception as e:
             _logger.error(f"Failed to load visualization mask: {e}")
             return None
+
+
+def _visualization_matches_reference(viz_masks, reference_masks, require_same_label=False) -> bool:
+    viz = np.squeeze(np.asarray(viz_masks))
+    ref = np.squeeze(np.asarray(reference_masks))
+    if viz.shape != ref.shape:
+        return False
+    if viz.size == 0:
+        return True
+    if not np.issubdtype(viz.dtype, np.integer):
+        return False
+    if int(viz.max()) > int(ref.max()):
+        return False
+    if require_same_label:
+        nonzero = viz > 0
+        return bool(np.all(ref[nonzero] == viz[nonzero]))
+    return True

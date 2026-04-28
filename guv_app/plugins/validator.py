@@ -27,8 +27,14 @@ def validate_visualization_mask(viz_mask: np.ndarray, original_mask: np.ndarray)
     Raises:
         ValueError: If any of the validation checks fail.
     """
-    # 1. Shape Check
-    if viz_mask.shape != original_mask.shape:
+    # 1. Shape Check — allow leading singleton dimensions to differ
+    # e.g. (512, 512) is compatible with (1, 512, 512) since both represent the same 2-D plane.
+    def _spatial_shape(s):
+        while s and s[0] == 1:
+            s = s[1:]
+        return s
+
+    if _spatial_shape(viz_mask.shape) != _spatial_shape(original_mask.shape):
         msg = (f"Shape mismatch: Visualization mask shape {viz_mask.shape} "
                f"does not match original mask shape {original_mask.shape}.")
         logger.error(msg)
