@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -47,6 +48,7 @@ IMAGE_SUFFIXES = {
     ".jpeg",
     ".bmp",
     ".nd2",
+    ".lif",
     ".npy",
 }
 
@@ -55,6 +57,7 @@ IMAGE_SUFFIXES = {
 class DistillConfig:
     data_dir: str | None
     file_list: str | None
+    train_root_dirs: tuple[str, ...]
     output_dir: str
     cpsam_model: str
     tile_size: int
@@ -82,12 +85,16 @@ class DistillConfig:
     train_device: str
     amp: bool
     normalize_percentiles: tuple[float, float]
+    feature_loss_weight: float
+    output_loss_weight: float
+    train_cpsam_head: bool
 
 
 @dataclass(frozen=True)
 class FrameRef:
     filename: str
     frame_id: str | None = None
+    source_group: str = "default"
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,12 @@ class TileSpec:
     ref_index: int
     y0: int
     x0: int
+
+
+@dataclass(frozen=True)
+class ImageFileRef:
+    path: Path
+    source_group: str
 
 
 class DepthwiseSeparableBlock(nn.Module):
@@ -256,6 +269,20 @@ class MobileNetV3EncoderStudent(nn.Module):
         return adapted
 
 
+class CPSAMReadoutHead(nn.Module):
+    """CPSAM neck-feature readout copied from the teacher."""
+
+    def __init__(self, out: nn.Conv2d, w2: torch.Tensor, ps: int):
+        super().__init__()
+        self.out = copy.deepcopy(out)
+        self.W2 = nn.Parameter(w2.detach().clone(), requires_grad=False)
+        self.ps = int(ps)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        x = self.out(features)
+        return F.conv_transpose2d(x, self.W2, stride=self.ps, padding=0)
+
+
 class ImageTileDataset(Dataset):
     def __init__(
         self,
@@ -284,15 +311,20 @@ class ImageTileDataset(Dataset):
         self.tile_specs = (
             self._build_tile_specs() if sampling_mode == "overlap-grid" else []
         )
+        self.ref_groups = self._group_indices_by_source(self.refs)
+        self.group_names = sorted(self.ref_groups)
+        self.tile_groups = self._group_tile_specs_by_source() if self.tile_specs else {}
 
     def __len__(self) -> int:
         if self.sampling_mode == "overlap-grid":
-            return len(self.tile_specs)
+            if not self.tile_groups:
+                return 0
+            return max(len(indices) for indices in self.tile_groups.values()) * len(self.tile_groups)
         return self.samples_per_epoch
 
     def __getitem__(self, index: int) -> torch.Tensor:
         if self.sampling_mode == "overlap-grid":
-            spec = self.tile_specs[index % len(self.tile_specs)]
+            spec = self._balanced_tile_spec(index)
             ref = self.refs[spec.ref_index]
             image = load_image(ref, self._image_service())
             image = to_channels_last_3(image)
@@ -301,7 +333,7 @@ class ImageTileDataset(Dataset):
             tile = np.moveaxis(tile, -1, 0).astype(np.float32, copy=False)
             return torch.from_numpy(tile)
 
-        ref = self.refs[index % len(self.refs)]
+        ref = self._balanced_ref(index)
         image = load_image(ref, self._image_service())
         image = to_channels_last_3(image)
         image = normalize_tile_cellpose(image, self.normalize_percentiles)
@@ -319,6 +351,33 @@ class ImageTileDataset(Dataset):
         if self.image_service is None:
             self.image_service = ImageService()
         return self.image_service
+
+    @staticmethod
+    def _group_indices_by_source(refs: Sequence[FrameRef]) -> dict[str, list[int]]:
+        groups: dict[str, list[int]] = {}
+        for index, ref in enumerate(refs):
+            groups.setdefault(ref.source_group, []).append(index)
+        return groups
+
+    def _balanced_ref(self, index: int) -> FrameRef:
+        group_name = self.group_names[index % len(self.group_names)]
+        candidates = self.ref_groups[group_name]
+        ref_index = random.choice(candidates)
+        return self.refs[ref_index]
+
+    def _group_tile_specs_by_source(self) -> dict[str, list[int]]:
+        groups: dict[str, list[int]] = {}
+        for spec_index, spec in enumerate(self.tile_specs):
+            group_name = self.refs[spec.ref_index].source_group
+            groups.setdefault(group_name, []).append(spec_index)
+        return groups
+
+    def _balanced_tile_spec(self, index: int) -> TileSpec:
+        group_names = sorted(self.tile_groups)
+        group_name = group_names[index % len(group_names)]
+        candidates = self.tile_groups[group_name]
+        within_group_index = (index // len(group_names)) % len(candidates)
+        return self.tile_specs[candidates[within_group_index]]
 
     def _build_tile_specs(self) -> list[TileSpec]:
         specs: list[TileSpec] = []
@@ -470,6 +529,11 @@ def teacher_encoder_forward(teacher: Transformer, x: torch.Tensor) -> torch.Tens
     return enc.neck(z.permute(0, 3, 1, 2))
 
 
+def cpsam_readout(features: torch.Tensor, out: nn.Module, w2: torch.Tensor, ps: int) -> torch.Tensor:
+    x = out(features)
+    return F.conv_transpose2d(x, w2, stride=ps, padding=0)
+
+
 def feature_loss(student_features: torch.Tensor, teacher_features: torch.Tensor) -> torch.Tensor:
     if student_features.shape[-2:] != teacher_features.shape[-2:]:
         student_features = F.interpolate(
@@ -487,39 +551,105 @@ def feature_loss(student_features: torch.Tensor, teacher_features: torch.Tensor)
     return mse + 0.1 * cos
 
 
-def discover_files(data_dir: str | None, file_list: str | None) -> list[Path]:
-    files: list[Path] = []
+def output_distill_loss(student_output: torch.Tensor, teacher_output: torch.Tensor) -> torch.Tensor:
+    if student_output.shape[-2:] != teacher_output.shape[-2:]:
+        student_output = F.interpolate(
+            student_output,
+            size=teacher_output.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    flow_mse = F.mse_loss(student_output[:, :-1], teacher_output[:, :-1])
+    cellprob_mse = F.mse_loss(student_output[:, -1:], teacher_output[:, -1:])
+
+    def gradient_xy(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        dy = x[..., 1:, :] - x[..., :-1, :]
+        dx = x[..., :, 1:] - x[..., :, :-1]
+        return dy, dx
+
+    s_dy, s_dx = gradient_xy(student_output[:, -1:])
+    t_dy, t_dx = gradient_xy(teacher_output[:, -1:])
+    edge_mse = F.mse_loss(s_dy, t_dy) + F.mse_loss(s_dx, t_dx)
+    return flow_mse + 2.0 * cellprob_mse + 0.25 * edge_mse
+
+
+def is_candidate_image_file(path: Path) -> bool:
+    stem = path.stem.lower()
+    return (
+        path.is_file()
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and stem != "classes"
+        and stem != "flows"
+        and not stem.endswith("_classes")
+        and not stem.endswith("_flows")
+        and "_masks" not in stem
+        and "_seg" not in stem
+        and "_pred" not in stem
+    )
+
+
+def discover_files(
+    data_dir: str | None,
+    file_list: str | None,
+    train_root_dirs: Sequence[str] = (),
+) -> list[ImageFileRef]:
+    files: list[ImageFileRef] = []
     if file_list:
         with open(file_list, "r", encoding="utf-8") as handle:
-            files.extend(Path(line.strip()) for line in handle if line.strip())
+            for line in handle:
+                raw_path = line.strip()
+                if not raw_path:
+                    continue
+                path = Path(raw_path.split("::", 1)[0])
+                if is_candidate_image_file(path):
+                    files.append(ImageFileRef(path, "file-list"))
     if data_dir:
         root = Path(data_dir)
         files.extend(
-            path
+            ImageFileRef(path, str(root.resolve()))
             for path in root.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in IMAGE_SUFFIXES
-            and "_masks" not in path.stem
-            and "_seg" not in path.stem
-            and "_pred" not in path.stem
+            if is_candidate_image_file(path)
         )
+    for root_dir in train_root_dirs:
+        root = Path(root_dir)
+        train_dirs = []
+        if root.name.lower() == "train" and root.is_dir():
+            train_dirs.append(root)
+        if root.exists():
+            train_dirs.extend(
+                path
+                for path in root.rglob("*")
+                if path.is_dir() and path.name.lower() == "train"
+            )
+        for train_dir in train_dirs:
+            group = str(train_dir.resolve())
+            files.extend(
+                ImageFileRef(path, group)
+                for path in train_dir.rglob("*")
+                if is_candidate_image_file(path)
+            )
     unique = []
     seen = set()
-    for path in files:
-        resolved = path.resolve()
+    for file_ref in files:
+        resolved = file_ref.path.resolve()
         if resolved not in seen:
             seen.add(resolved)
-            unique.append(resolved)
+            unique.append(ImageFileRef(resolved, file_ref.source_group))
     return unique
 
 
-def discover_frame_refs(data_dir: str | None, file_list: str | None) -> list[FrameRef]:
-    files = discover_files(data_dir, file_list)
+def discover_frame_refs(
+    data_dir: str | None,
+    file_list: str | None,
+    train_root_dirs: Sequence[str] = (),
+) -> list[FrameRef]:
+    files = discover_files(data_dir, file_list, train_root_dirs)
     image_service = ImageService()
     refs: list[FrameRef] = []
-    for path in files:
+    for file_ref in files:
+        path = file_ref.path
         if path.suffix.lower() == ".npy":
-            refs.append(FrameRef(str(path), None))
+            refs.append(FrameRef(str(path), None, file_ref.source_group))
             continue
         try:
             frame_refs = image_service.build_frame_references(str(path))
@@ -528,9 +658,9 @@ def discover_frame_refs(data_dir: str | None, file_list: str | None) -> list[Fra
         if frame_refs:
             for frame_ref in frame_refs:
                 base, frame_id = image_service.split_image_reference(frame_ref)
-                refs.append(FrameRef(base, frame_id))
+                refs.append(FrameRef(base, frame_id, file_ref.source_group))
         else:
-            refs.append(FrameRef(str(path), None))
+            refs.append(FrameRef(str(path), None, file_ref.source_group))
     return refs
 
 
@@ -563,6 +693,10 @@ def build_student(config: DistillConfig) -> nn.Module:
     raise ValueError(f"Unknown student backbone: {config.student_backbone}")
 
 
+def build_student_head_from_teacher(teacher: Transformer, device: torch.device) -> CPSAMReadoutHead:
+    return CPSAMReadoutHead(teacher.out, teacher.W2, teacher.ps).to(device)
+
+
 def save_checkpoint(
     output_dir: Path,
     student: nn.Module,
@@ -570,28 +704,31 @@ def save_checkpoint(
     config: DistillConfig,
     epoch: int,
     loss: float,
+    student_head: nn.Module | None = None,
     best: bool = False,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     name = "cpsam_encoder_student_best.pt" if best else f"cpsam_encoder_student_epoch_{epoch:04d}.pt"
     path = output_dir / name
-    torch.save(
-        {
-            "student_state_dict": student.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": asdict(config),
-            "epoch": epoch,
-            "loss": loss,
-            "feature_target": "cpsam Transformer.encoder.neck output",
-        },
-        path,
-    )
+    payload = {
+        "student_state_dict": student.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": asdict(config),
+        "epoch": epoch,
+        "loss": loss,
+        "feature_target": "cpsam Transformer.encoder.neck output",
+        "output_target": "cpsam Transformer.forward output maps",
+    }
+    if student_head is not None:
+        payload["student_head_state_dict"] = student_head.state_dict()
+    torch.save(payload, path)
     return path
 
 
 def load_student_checkpoint(
     path: str,
     student: nn.Module,
+    student_head: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     device: torch.device | str = "cpu",
     strict: bool = True,
@@ -601,6 +738,16 @@ def load_student_checkpoint(
     missing, unexpected = student.load_state_dict(state, strict=strict)
     if missing or unexpected:
         print(f"student checkpoint load: missing={missing}, unexpected={unexpected}")
+    if student_head is not None and "student_head_state_dict" in checkpoint:
+        head_missing, head_unexpected = student_head.load_state_dict(
+            checkpoint["student_head_state_dict"],
+            strict=False,
+        )
+        if head_missing or head_unexpected:
+            print(
+                "student head checkpoint load: "
+                f"missing={head_missing}, unexpected={head_unexpected}"
+            )
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return int(checkpoint.get("epoch", 0))
@@ -611,8 +758,15 @@ def train(config: DistillConfig) -> None:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
-    refs = discover_frame_refs(config.data_dir, config.file_list)
+    refs = discover_frame_refs(config.data_dir, config.file_list, config.train_root_dirs)
     print(f"discovered {len(refs)} image/frame references")
+    group_counts: dict[str, int] = {}
+    for ref in refs:
+        group_counts[ref.source_group] = group_counts.get(ref.source_group, 0) + 1
+    if len(group_counts) > 1:
+        print(f"balanced sampling across {len(group_counts)} source groups")
+        for group_name, count in sorted(group_counts.items()):
+            print(f"  {group_name}: {count} image/frame references")
     samples_per_epoch = config.steps_per_epoch * config.batch_size
     dataset = ImageTileDataset(
         refs,
@@ -638,21 +792,37 @@ def train(config: DistillConfig) -> None:
     train_device = torch.device(config.train_device)
     teacher = build_teacher(config.cpsam_model, teacher_device, config.tile_size)
     student = build_student(config).to(train_device)
+    student_head = build_student_head_from_teacher(teacher, train_device)
+    if not config.train_cpsam_head:
+        student_head.eval()
+        for param in student_head.parameters():
+            param.requires_grad_(False)
 
+    trainable_params = list(student.parameters())
+    if config.train_cpsam_head:
+        trainable_params.extend(param for param in student_head.parameters() if param.requires_grad)
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        trainable_params,
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
     start_epoch = 0
     if config.init_student:
         print(f"initializing student from {config.init_student}")
-        load_student_checkpoint(config.init_student, student, optimizer=None, device=train_device, strict=False)
+        load_student_checkpoint(
+            config.init_student,
+            student,
+            student_head=student_head,
+            optimizer=None,
+            device=train_device,
+            strict=False,
+        )
     if config.resume_student:
         print(f"resuming student/optimizer from {config.resume_student}")
         start_epoch = load_student_checkpoint(
             config.resume_student,
             student,
+            student_head=student_head,
             optimizer=optimizer,
             device=train_device,
             strict=False,
@@ -669,14 +839,30 @@ def train(config: DistillConfig) -> None:
     best_loss = math.inf
     for epoch in range(start_epoch + 1, start_epoch + config.epochs + 1):
         student.train()
+        if config.train_cpsam_head:
+            student_head.train()
+        else:
+            student_head.eval()
         losses = []
+        feature_losses = []
+        output_losses = []
         progress = tqdm(loader, desc=f"epoch {epoch}/{config.epochs}", leave=False)
         for batch in progress:
             batch = batch.to(train_device, non_blocking=True)
             with torch.no_grad():
                 teacher_batch = batch.to(teacher_device, non_blocking=True)
                 teacher_features = teacher_encoder_forward(teacher, teacher_batch)
+                teacher_output = None
+                if config.output_loss_weight:
+                    teacher_output = cpsam_readout(
+                        teacher_features,
+                        teacher.out,
+                        teacher.W2,
+                        teacher.ps,
+                    )
                 teacher_features = teacher_features.to(train_device, non_blocking=True)
+                if teacher_output is not None:
+                    teacher_output = teacher_output.to(train_device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(
@@ -684,21 +870,37 @@ def train(config: DistillConfig) -> None:
                 enabled=config.amp and train_device.type == "cuda",
             ):
                 student_features = student(batch)
-                loss = feature_loss(student_features, teacher_features)
+                f_loss = feature_loss(student_features, teacher_features)
+                loss = config.feature_loss_weight * f_loss
+                o_loss = None
+                if config.output_loss_weight:
+                    student_output = student_head(student_features)
+                    o_loss = output_distill_loss(student_output, teacher_output)
+                    loss = loss + config.output_loss_weight * o_loss
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             value = float(loss.detach().cpu())
             losses.append(value)
-            progress.set_postfix(loss=f"{value:.5f}")
+            feature_losses.append(float(f_loss.detach().cpu()))
+            postfix = {"loss": f"{value:.5f}", "feat": f"{feature_losses[-1]:.5f}"}
+            if o_loss is not None:
+                output_losses.append(float(o_loss.detach().cpu()))
+                postfix["out"] = f"{output_losses[-1]:.5f}"
+            progress.set_postfix(**postfix)
 
         mean_loss = float(np.mean(losses)) if losses else math.inf
-        print(f"epoch {epoch}: loss={mean_loss:.6f}")
-        save_checkpoint(output_dir, student, optimizer, config, epoch, mean_loss, best=False)
+        mean_feature = float(np.mean(feature_losses)) if feature_losses else math.inf
+        mean_output = float(np.mean(output_losses)) if output_losses else 0.0
+        print(
+            f"epoch {epoch}: loss={mean_loss:.6f} "
+            f"feature={mean_feature:.6f} output={mean_output:.6f}"
+        )
+        save_checkpoint(output_dir, student, optimizer, config, epoch, mean_loss, student_head, best=False)
         if mean_loss < best_loss:
             best_loss = mean_loss
-            best_path = save_checkpoint(output_dir, student, optimizer, config, epoch, mean_loss, best=True)
+            best_path = save_checkpoint(output_dir, student, optimizer, config, epoch, mean_loss, student_head, best=True)
             print(f"saved best checkpoint: {best_path}")
 
 
@@ -706,6 +908,15 @@ def parse_args(argv: Sequence[str] | None = None) -> DistillConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=None, help="Directory of training images.")
     parser.add_argument("--file-list", default=None, help="Text file containing one image path per line.")
+    parser.add_argument(
+        "--train-root-dirs",
+        nargs="+",
+        default=(),
+        help=(
+            "Root directories to search for descendant directories named 'train'. "
+            "Compatible images are collected recursively from those train directories only."
+        ),
+    )
     parser.add_argument("--output-dir", default="distilled_cpsam_encoder", help="Checkpoint output directory.")
     parser.add_argument("--cpsam-model", default="cpsam", help="'cpsam' or path to a CPSAM checkpoint.")
     parser.add_argument("--tile-size", type=int, default=256, help="Square tile size. CPSAM default is 256.")
@@ -757,12 +968,30 @@ def parse_args(argv: Sequence[str] | None = None) -> DistillConfig:
     parser.add_argument("--train-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision for student training.")
     parser.add_argument("--normalize-percentiles", type=float, nargs=2, default=(1.0, 99.0))
+    parser.add_argument(
+        "--feature-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for matching CPSAM encoder neck features.",
+    )
+    parser.add_argument(
+        "--output-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for matching CPSAM final flow/cellprob output maps.",
+    )
+    parser.add_argument(
+        "--train-cpsam-head",
+        action="store_true",
+        help="Train and save a copied CPSAM readout head with the student encoder.",
+    )
     args = parser.parse_args(argv)
-    if args.data_dir is None and args.file_list is None:
-        parser.error("Provide --data-dir and/or --file-list.")
+    if args.data_dir is None and args.file_list is None and not args.train_root_dirs:
+        parser.error("Provide --data-dir, --file-list, and/or --train-root-dirs.")
     return DistillConfig(
         data_dir=args.data_dir,
         file_list=args.file_list,
+        train_root_dirs=tuple(args.train_root_dirs),
         output_dir=args.output_dir,
         cpsam_model=args.cpsam_model,
         tile_size=args.tile_size,
@@ -790,6 +1019,9 @@ def parse_args(argv: Sequence[str] | None = None) -> DistillConfig:
         train_device=args.train_device,
         amp=bool(args.amp),
         normalize_percentiles=tuple(args.normalize_percentiles),
+        feature_loss_weight=float(args.feature_loss_weight),
+        output_loss_weight=float(args.output_loss_weight),
+        train_cpsam_head=bool(args.train_cpsam_head),
     )
 
 

@@ -18,6 +18,11 @@ models_logger = logging.getLogger(__name__)
 
 from . import transforms, dynamics, utils, plot
 from .vit_sam import Transformer
+from .cpsam_student import (
+    is_cpsam_student_encoder_checkpoint,
+    load_cpsam_student_encoder,
+    load_cpsam_student_head,
+)
 from .core import assign_device, run_net, run_3D
 
 _CPSAM_MODEL_URL = "https://huggingface.co/mouseland/cellpose-sam/resolve/main/cpsam"
@@ -91,7 +96,7 @@ class CellposeModel():
 
     def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
                  diam_mean=None, device=None, nchan=None, nclasses=4,
-                 semantic_classes=None):
+                 semantic_classes=None, student_encoder_model=None):
         """
         Initialize the CellposeModel.
 
@@ -132,6 +137,16 @@ class CellposeModel():
             raise ValueError("Must specify a pretrained model, training from scratch is not implemented")
         
         ### create neural network
+        student_encoder_path = student_encoder_model
+        if student_encoder_path is None and pretrained_model and os.path.exists(pretrained_model):
+            if is_cpsam_student_encoder_checkpoint(pretrained_model):
+                student_encoder_path = pretrained_model
+                pretrained_model = "cpsam"
+                models_logger.info(
+                    "Detected CPSAM student encoder checkpoint; loading CPSAM "
+                    "weights for decoder/head and using student encoder %s",
+                    student_encoder_path,
+                )
         
         print(f">> found path: {os.path.exists(pretrained_model)}")
         
@@ -149,6 +164,7 @@ class CellposeModel():
                 )
 
         self.pretrained_model = pretrained_model
+        self.student_encoder_model = student_encoder_path
         # if cpsam is selected with semantic classes, initialize head exactly like tools/train_inst_seg_fixed.py
         try:
             if semantic_classes is not None and os.path.basename(self.pretrained_model) == "cpsam":
@@ -184,10 +200,13 @@ class CellposeModel():
                         requires_grad=False,
                     )
                     net.to(self.device)
+                    self._attach_student_encoder_if_requested()
                     print(f">> No. of network output channels: {nout + nclasses}")
                     print(f">> semantic classes: {nclasses} (cpsam semantic init)")
                     return
         except Exception:
+            if self.student_encoder_model:
+                raise
             pass
 
         # instantiate net with output size matching checkpoint if possible
@@ -232,6 +251,7 @@ class CellposeModel():
             except TypeError:
                 # older load_model signature without strict
                 self.net.load_model(self.pretrained_model, device=self.device)
+            self._attach_student_encoder_if_requested()
         else:
             if os.path.split(self.pretrained_model)[-1] != 'cpsam':
                 raise FileNotFoundError('model file not recognized')
@@ -239,7 +259,22 @@ class CellposeModel():
             self.net = net
             self.net.to(self.device)
             self.net.load_model(self.pretrained_model, device=self.device)
+            self._attach_student_encoder_if_requested()
         
+    def _attach_student_encoder_if_requested(self):
+        if not getattr(self, "student_encoder_model", None):
+            return
+        if not hasattr(self.net, "set_student_encoder"):
+            raise RuntimeError("Current network does not support a CPSAM student encoder.")
+        student = load_cpsam_student_encoder(self.student_encoder_model, device=self.device)
+        self.net.set_student_encoder(student)
+        head_loaded = load_cpsam_student_head(self.student_encoder_model, self.net, device=self.device)
+        self.net.to(self.device)
+        models_logger.info(
+            "Loaded CPSAM student encoder%s from %s",
+            " and readout head" if head_loaded else "",
+            self.student_encoder_model,
+        )
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
              z_axis=None, normalize=True, invert=False, rescale=None, diameter=None,

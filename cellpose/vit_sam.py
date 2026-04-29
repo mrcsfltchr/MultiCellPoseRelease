@@ -48,26 +48,34 @@ class Transformer(nn.Module):
         # set attention to global in every layer
         for blk in self.encoder.blocks:
             blk.window_size = 0
+        self.student_encoder = None
 
-    def forward(self, x):      
-        # same progression as SAM until readout
-        x = self.encoder.patch_embed(x)
-        
-        if self.encoder.pos_embed is not None:
-            x = x + self.encoder.pos_embed
-        
-        if self.training and self.rdrop > 0:
-            nlay = len(self.encoder.blocks)
-            rdrop = (torch.rand((len(x), nlay), device=x.device) < 
-                     torch.linspace(0, self.rdrop, nlay, device=x.device)).float()
-            for i, blk in enumerate(self.encoder.blocks):            
-                mask = rdrop[:,i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                x = x * mask + blk(x) * (1-mask)
+    def set_student_encoder(self, student_encoder):
+        """Replace the CPSAM ViT encoder path with a distilled feature encoder."""
+        self.student_encoder = student_encoder
+
+    def forward(self, x):
+        if self.student_encoder is not None:
+            x = self.student_encoder(x)
         else:
-            for blk in self.encoder.blocks:
-                x = blk(x)
+            # same progression as SAM until readout
+            x = self.encoder.patch_embed(x)
+            
+            if self.encoder.pos_embed is not None:
+                x = x + self.encoder.pos_embed
+            
+            if self.training and self.rdrop > 0:
+                nlay = len(self.encoder.blocks)
+                rdrop = (torch.rand((len(x), nlay), device=x.device) < 
+                         torch.linspace(0, self.rdrop, nlay, device=x.device)).float()
+                for i, blk in enumerate(self.encoder.blocks):            
+                    mask = rdrop[:,i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                    x = x * mask + blk(x) * (1-mask)
+            else:
+                for blk in self.encoder.blocks:
+                    x = blk(x)
 
-        x = self.encoder.neck(x.permute(0, 3, 1, 2))
+            x = self.encoder.neck(x.permute(0, 3, 1, 2))
 
         # readout is changed here
         x1 = self.out(x)

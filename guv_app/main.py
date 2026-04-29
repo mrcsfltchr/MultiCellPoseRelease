@@ -7,8 +7,14 @@ from pathlib import Path
 try:
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtGui import QIcon
-except ImportError:
-    print("PyQt6 not installed. Please install it with 'pip install PyQt6'")
+except ImportError as exc:
+    print("PyQt6 could not be imported.")
+    print(f"Python executable: {sys.executable}")
+    print(f"Import error: {exc}")
+    print(
+        "If PyQt6 is already installed, this is usually a Qt DLL mismatch in "
+        "the active environment rather than a missing package."
+    )
     sys.exit(1)
 
 from guv_app.controllers.home_controller import HomeController
