@@ -78,6 +78,7 @@ class FPNThreeStageConfig:
     stage3_seg_weight: float
     stage3_flow_direction_weight: float
     stage3_flow_device: str
+    stage3_flow_cache_dir: str | None
     mobilenet_weights: str
     mobilenet_weights_path: str | None
     fpn_tap_layers: tuple[int, ...]
@@ -187,6 +188,11 @@ def parse_args(argv: Sequence[str] | None = None) -> FPNThreeStageConfig:
         default="cpu",
         help="Device used to precompute supervised label flow targets before stage 3, e.g. cpu or cuda.",
     )
+    parser.add_argument(
+        "--stage3-flow-cache-dir",
+        default=None,
+        help="Directory for cached supervised flow .npy files. Defaults to <output-dir>/supervised_flow_cache.",
+    )
     parser.add_argument("--mobilenet-weights", default="imagenet", choices=("imagenet", "none"))
     parser.add_argument("--mobilenet-weights-path", default=None)
     parser.add_argument(
@@ -242,6 +248,7 @@ def parse_args(argv: Sequence[str] | None = None) -> FPNThreeStageConfig:
         stage3_seg_weight=args.stage3_seg_weight,
         stage3_flow_direction_weight=args.stage3_flow_direction_weight,
         stage3_flow_device=args.stage3_flow_device,
+        stage3_flow_cache_dir=args.stage3_flow_cache_dir,
         mobilenet_weights=args.mobilenet_weights,
         mobilenet_weights_path=args.mobilenet_weights_path,
         fpn_tap_layers=tuple(args.fpn_tap_layers),

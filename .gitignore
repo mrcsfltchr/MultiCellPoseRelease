@@ -43,6 +43,13 @@ models/
 *.log
 *.tmp
 
+# Training outputs/checkpoints
+distilled_cpsam_encoder*/
+supervised_flow_cache/
+*.pt
+*.pth
+*.npy
+
 # Editor/OS
 .vscode/
 .idea/

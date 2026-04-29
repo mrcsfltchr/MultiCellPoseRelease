@@ -98,6 +98,7 @@ class ThreeStageConfig:
     stage3_seg_weight: float
     stage3_flow_direction_weight: float
     stage3_flow_device: str
+    stage3_flow_cache_dir: str | None
     mobilenet_weights: str
     mobilenet_weights_path: str | None
     mobilenet_tap_layer: int
@@ -377,7 +378,8 @@ def make_distill_loader(config: ThreeStageConfig, refs) -> DataLoader:
 
 def make_supervised_loader(config: ThreeStageConfig, pairs) -> DataLoader:
     samples_per_epoch = config.steps_per_epoch * config.batch_size
-    flow_cache_dir = Path(config.output_dir) / "supervised_flow_cache"
+    configured_cache_dir = getattr(config, "stage3_flow_cache_dir", None)
+    flow_cache_dir = Path(configured_cache_dir) if configured_cache_dir else Path(config.output_dir) / "supervised_flow_cache"
     flow_device = torch.device(getattr(config, "stage3_flow_device", "cpu"))
     if flow_device.type != "cpu":
         precompute_supervised_flow_cache(pairs, flow_cache_dir, flow_device)
@@ -733,6 +735,11 @@ def parse_args(argv: Sequence[str] | None = None) -> ThreeStageConfig:
         default="cpu",
         help="Device used to precompute supervised label flow targets before stage 3, e.g. cpu or cuda.",
     )
+    parser.add_argument(
+        "--stage3-flow-cache-dir",
+        default=None,
+        help="Directory for cached supervised flow .npy files. Defaults to <output-dir>/supervised_flow_cache.",
+    )
     parser.add_argument("--mobilenet-weights", default="imagenet", choices=("imagenet", "none"))
     parser.add_argument("--mobilenet-weights-path", default=None)
     parser.add_argument("--mobilenet-tap-layer", type=int, default=6)
@@ -781,6 +788,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ThreeStageConfig:
         stage3_seg_weight=args.stage3_seg_weight,
         stage3_flow_direction_weight=args.stage3_flow_direction_weight,
         stage3_flow_device=args.stage3_flow_device,
+        stage3_flow_cache_dir=args.stage3_flow_cache_dir,
         mobilenet_weights=args.mobilenet_weights,
         mobilenet_weights_path=args.mobilenet_weights_path,
         mobilenet_tap_layer=args.mobilenet_tap_layer,
