@@ -99,6 +99,9 @@ class ThreeStageConfig:
     stage3_flow_direction_weight: float
     stage3_flow_device: str
     stage3_flow_cache_dir: str | None
+    stage3_lr: float | None
+    stage3_train_mode: str
+    stage3_output_distill_weight: float
     mobilenet_weights: str
     mobilenet_weights_path: str | None
     mobilenet_tap_layer: int
@@ -406,8 +409,8 @@ def make_supervised_loader(config: ThreeStageConfig, pairs) -> DataLoader:
     return DataLoader(dataset, **loader_kwargs)
 
 
-def make_optimizer(config: ThreeStageConfig, student, student_head, train_head: bool):
-    params = list(student.parameters())
+def make_optimizer(config: ThreeStageConfig, student, student_head, train_head: bool, lr: float | None = None):
+    params = [param for param in student.parameters() if param.requires_grad]
     if train_head:
         for param in student_head.parameters():
             param.requires_grad_(True)
@@ -415,7 +418,31 @@ def make_optimizer(config: ThreeStageConfig, student, student_head, train_head: 
     else:
         for param in student_head.parameters():
             param.requires_grad_(False)
-    return torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+    if not params:
+        raise ValueError("No trainable parameters selected for optimizer.")
+    return torch.optim.AdamW(params, lr=config.lr if lr is None else lr, weight_decay=config.weight_decay)
+
+
+def configure_stage3_trainable(student, student_head, mode: str) -> None:
+    mode = str(mode).lower()
+    if mode not in {"full", "head-only", "adapter-only"}:
+        raise ValueError("--stage3-train-mode must be one of: full, head-only, adapter-only")
+
+    for param in student.parameters():
+        param.requires_grad_(mode == "full")
+    for param in student_head.parameters():
+        param.requires_grad_(True)
+
+    if mode == "adapter-only":
+        for attr in ("adapter", "lateral", "context"):
+            module = getattr(student, attr, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(True)
+
+    trainable = sum(param.numel() for param in list(student.parameters()) + list(student_head.parameters()) if param.requires_grad)
+    total = sum(param.numel() for param in list(student.parameters()) + list(student_head.parameters()))
+    print(f"stage3 train mode: {mode}; trainable parameters: {trainable:,}/{total:,}")
 
 
 def save_stage_checkpoint(output_dir, stage_name, student, student_head, optimizer, config, epoch, loss, best=False):
@@ -590,13 +617,34 @@ def run_output_stage(config, loader, teacher, student, student_head, train_devic
             save_stage_checkpoint(config.output_dir, "stage2_output", student, student_head, optimizer, config, epoch, mean_loss, best=True)
 
 
-def run_supervised_stage(config, loader, student, student_head, train_device):
-    optimizer = make_optimizer(config, student, student_head, train_head=True)
+def run_supervised_stage(config, loader, student, student_head, train_device, teacher=None, teacher_device=None):
+    configure_stage3_trainable(student, student_head, getattr(config, "stage3_train_mode", "full"))
+    stage3_lr = getattr(config, "stage3_lr", None)
+    optimizer = make_optimizer(config, student, student_head, train_head=True, lr=stage3_lr)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and train_device.type == "cuda")
     best_loss = math.inf
+    output_distill_weight = float(getattr(config, "stage3_output_distill_weight", 0.0))
+    if output_distill_weight > 0.0 and teacher is None:
+        raise ValueError("--stage3-output-distill-weight requires a teacher model.")
+    if output_distill_weight > 0.0:
+        teacher.eval()
     for epoch in range(1, config.stage3_epochs + 1):
         student.train()
         student_head.train()
+        stage3_train_mode = getattr(config, "stage3_train_mode", "full").lower()
+        if stage3_train_mode == "head-only":
+            student.eval()
+        elif stage3_train_mode == "adapter-only":
+            for attr in ("features", "encoder"):
+                module = getattr(student, attr, None)
+                if module is not None:
+                    module.eval()
+            for attr in ("adapter", "lateral", "context"):
+                module = getattr(student, attr, None)
+                if module is not None:
+                    module.train()
+        if output_distill_weight > 0.0:
+            teacher.eval()
         losses = []
         progress = tqdm(loader, desc=f"stage3 supervised {epoch}/{config.stage3_epochs}", leave=False)
         iterator = iter(progress)
@@ -617,11 +665,24 @@ def run_supervised_stage(config, loader, student, student_head, train_device):
             transfer_seconds = time.perf_counter() - transfer_start
             optimizer.zero_grad(set_to_none=True)
             forward_start = time.perf_counter()
+            teacher_output = None
+            if output_distill_weight > 0.0:
+                with torch.no_grad():
+                    teacher_batch = batch.to(teacher_device, non_blocking=True)
+                    with torch.amp.autocast(
+                        device_type=teacher_device.type,
+                        enabled=config.amp and teacher_device.type == "cuda",
+                    ):
+                        teacher_features = teacher_encoder_forward(teacher, teacher_batch)
+                        teacher_output = cpsam_readout(teacher_features, teacher.out, teacher.W2, teacher.ps)
+                    teacher_output = teacher_output.to(train_device, non_blocking=True)
             with torch.amp.autocast(device_type=train_device.type, enabled=config.amp and train_device.type == "cuda"):
                 y = student_head(student(batch))
                 seg_loss = _loss_fn_seg(lbl, y, train_device)
                 dir_loss = supervised_flow_direction_loss(lbl, y)
+                distill_loss = output_distill_loss(y, teacher_output) if teacher_output is not None else y.new_tensor(0.0)
                 loss = config.stage3_seg_weight * seg_loss + config.stage3_flow_direction_weight * dir_loss
+                loss = loss + output_distill_weight * distill_loss
             if train_device.type == "cuda":
                 torch.cuda.synchronize()
             forward_seconds = time.perf_counter() - forward_start
@@ -633,7 +694,12 @@ def run_supervised_stage(config, loader, student, student_head, train_device):
                 torch.cuda.synchronize()
             backward_seconds = time.perf_counter() - backward_start
             losses.append(float(loss.detach().cpu()))
-            progress.set_postfix(loss=f"{losses[-1]:.5f}", seg=f"{float(seg_loss.detach().cpu()):.5f}", dir=f"{float(dir_loss.detach().cpu()):.5f}")
+            progress.set_postfix(
+                loss=f"{losses[-1]:.5f}",
+                seg=f"{float(seg_loss.detach().cpu()):.5f}",
+                dir=f"{float(dir_loss.detach().cpu()):.5f}",
+                dist=f"{float(distill_loss.detach().cpu()):.5f}",
+            )
             if batch_index <= getattr(config, "profile_batches", 0):
                 print(
                     "PROFILE stage3 batch "
@@ -693,7 +759,7 @@ def train(config: ThreeStageConfig) -> None:
             print("stage3 requested, but no matching *_masks.tif/_masks.tiff/_masks.png or *_seg.npy labels were found; skipping supervised fine-tuning")
         else:
             supervised_loader = make_supervised_loader(config, pairs)
-            run_supervised_stage(config, supervised_loader, student, student_head, train_device)
+            run_supervised_stage(config, supervised_loader, student, student_head, train_device, teacher, teacher_device)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> ThreeStageConfig:
@@ -730,6 +796,19 @@ def parse_args(argv: Sequence[str] | None = None) -> ThreeStageConfig:
     parser.add_argument("--stage2-flow-direction-weight", type=float, default=1.0)
     parser.add_argument("--stage3-seg-weight", type=float, default=1.0)
     parser.add_argument("--stage3-flow-direction-weight", type=float, default=0.5)
+    parser.add_argument("--stage3-lr", type=float, default=None, help="Optional learning rate override for stage 3.")
+    parser.add_argument(
+        "--stage3-train-mode",
+        default="full",
+        choices=("full", "head-only", "adapter-only"),
+        help="Which student parameters to update during supervised stage 3.",
+    )
+    parser.add_argument(
+        "--stage3-output-distill-weight",
+        type=float,
+        default=0.0,
+        help="Optional teacher output distillation weight during supervised stage 3.",
+    )
     parser.add_argument(
         "--stage3-flow-device",
         default="cpu",
@@ -789,6 +868,9 @@ def parse_args(argv: Sequence[str] | None = None) -> ThreeStageConfig:
         stage3_flow_direction_weight=args.stage3_flow_direction_weight,
         stage3_flow_device=args.stage3_flow_device,
         stage3_flow_cache_dir=args.stage3_flow_cache_dir,
+        stage3_lr=args.stage3_lr,
+        stage3_train_mode=args.stage3_train_mode,
+        stage3_output_distill_weight=args.stage3_output_distill_weight,
         mobilenet_weights=args.mobilenet_weights,
         mobilenet_weights_path=args.mobilenet_weights_path,
         mobilenet_tap_layer=args.mobilenet_tap_layer,

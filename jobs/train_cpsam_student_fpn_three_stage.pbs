@@ -1,23 +1,26 @@
 #!/bin/bash
 #PBS -N cpsam_fpn_3stage
 #PBS -l select=1:ncpus=16:ngpus=1:mem=24gb
-#PBS -l walltime=24:00:00
+#PBS -l walltime=5:00:00
 #PBS -j oe
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose}"
 TRAIN_ROOT_DIRS="${TRAIN_ROOT_DIRS:-$HOME/FoundationTrain}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/FoundationTrain/distilled_cpsam_encoder_fpn_three_stage}"
-CONDA_ENV="${CONDA_ENV:-mcp_pub}"
+CONDA_ENV="${CONDA_ENV:-cpsam_foundation310}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 STAGE3_FLOW_CACHE_DIR="${STAGE3_FLOW_CACHE_DIR:-${EPHEMERAL:-$OUTPUT_DIR}/cpsam_fpn_supervised_flow_cache}"
 
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-100}"
-STAGE3_EPOCHS="${STAGE3_EPOCHS:-100}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-300}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-200}"
+STAGE3_EPOCHS="${STAGE3_EPOCHS:-300}"
+STAGE3_LR="${STAGE3_LR:-1e-5}"
+STAGE3_TRAIN_MODE="${STAGE3_TRAIN_MODE:-head-only}"
+STAGE3_OUTPUT_DISTILL_WEIGHT="${STAGE3_OUTPUT_DISTILL_WEIGHT:-0.1}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
 cd "$REPO_DIR"
@@ -53,6 +56,9 @@ echo "STAGE3_FLOW_CACHE_DIR=$STAGE3_FLOW_CACHE_DIR"
 echo "STAGE1_EPOCHS=$STAGE1_EPOCHS"
 echo "STAGE2_EPOCHS=$STAGE2_EPOCHS"
 echo "STAGE3_EPOCHS=$STAGE3_EPOCHS"
+echo "STAGE3_LR=$STAGE3_LR"
+echo "STAGE3_TRAIN_MODE=$STAGE3_TRAIN_MODE"
+echo "STAGE3_OUTPUT_DISTILL_WEIGHT=$STAGE3_OUTPUT_DISTILL_WEIGHT"
 
 python "$REPO_DIR/tools/train_cpsam_student_fpn_three_stage.py" \
     --train-root-dirs ${TRAIN_ROOT_DIRS} \
@@ -60,6 +66,9 @@ python "$REPO_DIR/tools/train_cpsam_student_fpn_three_stage.py" \
     --stage1-epochs "$STAGE1_EPOCHS" \
     --stage2-epochs "$STAGE2_EPOCHS" \
     --stage3-epochs "$STAGE3_EPOCHS" \
+    --stage3-lr "$STAGE3_LR" \
+    --stage3-train-mode "$STAGE3_TRAIN_MODE" \
+    --stage3-output-distill-weight "$STAGE3_OUTPUT_DISTILL_WEIGHT" \
     --steps-per-epoch "$STEPS_PER_EPOCH" \
     --batch-size "$BATCH_SIZE" \
     --num-workers "$NUM_WORKERS" \

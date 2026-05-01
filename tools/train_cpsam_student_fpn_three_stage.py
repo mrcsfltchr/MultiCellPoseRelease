@@ -79,6 +79,9 @@ class FPNThreeStageConfig:
     stage3_flow_direction_weight: float
     stage3_flow_device: str
     stage3_flow_cache_dir: str | None
+    stage3_lr: float | None
+    stage3_train_mode: str
+    stage3_output_distill_weight: float
     mobilenet_weights: str
     mobilenet_weights_path: str | None
     fpn_tap_layers: tuple[int, ...]
@@ -146,7 +149,7 @@ def train(config: FPNThreeStageConfig) -> None:
             print("stage3 requested, but no matching *_masks.tif/_masks.tiff/_masks.png or *_seg.npy labels were found; skipping supervised fine-tuning")
         else:
             supervised_loader = make_supervised_loader(config, pairs)
-            run_supervised_stage(config, supervised_loader, student, student_head, train_device)
+            run_supervised_stage(config, supervised_loader, student, student_head, train_device, teacher, teacher_device)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> FPNThreeStageConfig:
@@ -183,6 +186,19 @@ def parse_args(argv: Sequence[str] | None = None) -> FPNThreeStageConfig:
     parser.add_argument("--stage2-flow-direction-weight", type=float, default=1.0)
     parser.add_argument("--stage3-seg-weight", type=float, default=1.0)
     parser.add_argument("--stage3-flow-direction-weight", type=float, default=0.5)
+    parser.add_argument("--stage3-lr", type=float, default=None, help="Optional learning rate override for stage 3.")
+    parser.add_argument(
+        "--stage3-train-mode",
+        default="full",
+        choices=("full", "head-only", "adapter-only"),
+        help="Which student parameters to update during supervised stage 3.",
+    )
+    parser.add_argument(
+        "--stage3-output-distill-weight",
+        type=float,
+        default=0.0,
+        help="Optional teacher output distillation weight during supervised stage 3.",
+    )
     parser.add_argument(
         "--stage3-flow-device",
         default="cpu",
@@ -249,6 +265,9 @@ def parse_args(argv: Sequence[str] | None = None) -> FPNThreeStageConfig:
         stage3_flow_direction_weight=args.stage3_flow_direction_weight,
         stage3_flow_device=args.stage3_flow_device,
         stage3_flow_cache_dir=args.stage3_flow_cache_dir,
+        stage3_lr=args.stage3_lr,
+        stage3_train_mode=args.stage3_train_mode,
+        stage3_output_distill_weight=args.stage3_output_distill_weight,
         mobilenet_weights=args.mobilenet_weights,
         mobilenet_weights_path=args.mobilenet_weights_path,
         fpn_tap_layers=tuple(args.fpn_tap_layers),
