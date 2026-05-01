@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -N cpsam_finetune
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+ROOT_DIRS="${ROOT_DIRS:-$HOME/FoundationTrain $HOME/cpsamOODtest}"
+OUTPUT_DIR="${OUTPUT_DIR:-$HOME/FoundationTrain/cpsam_finetune_balanced}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
+
+EPOCHS="${EPOCHS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-24}"
+UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-9}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+TEST_RATIO="${TEST_RATIO:-0.1}"
+SEED="${SEED:-17}"
+
+cd "$REPO_DIR"
+
+module load "$CUDA_MODULE" 2>/dev/null || true
+
+if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+elif [ -x "$HOME/miniforge3/bin/conda" ]; then
+    eval "$($HOME/miniforge3/bin/conda shell.bash hook)"
+else
+    echo "ERROR: conda not found in $HOME/miniconda3 or $HOME/miniforge3"
+    exit 2
+fi
+conda activate "$CONDA_ENV"
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "Job ID: ${PBS_JOBID}"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+python -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
+echo "REPO_DIR=$REPO_DIR"
+echo "ROOT_DIRS=$ROOT_DIRS"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+echo "CONDA_ENV=$CONDA_ENV"
+echo "CUDA_MODULE=$CUDA_MODULE"
+echo "EPOCHS=$EPOCHS"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
+
+python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
+    --root-dirs $ROOT_DIRS \
+    --output-dir "$OUTPUT_DIR" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --learning-rate "$LEARNING_RATE" \
+    --unfreeze-blocks "$UNFREEZE_BLOCKS" \
+    --val-ratio "$VAL_RATIO" \
+    --test-ratio "$TEST_RATIO" \
+    --seed "$SEED" \
+    --balance-mode source
+
+echo "Finish: $(date)"

@@ -29,6 +29,9 @@ OUTPUT_DIR="$HOME/FoundationTrain/distilled_cpsam_encoder_fpn_three_stage" \
 CONDA_ENV="cpsam_foundation310" \
 CUDA_MODULE="cuda/12.1" \
 STAGE3_FLOW_CACHE_DIR="${EPHEMERAL:-$HOME/FoundationTrain/distilled_cpsam_encoder_fpn_three_stage}/cpsam_fpn_supervised_flow_cache" \
+STAGE3_LR="1e-5" \
+STAGE3_TRAIN_MODE="head-only" \
+STAGE3_OUTPUT_DISTILL_WEIGHT="0.1" \
 bash jobs/submit_cpsam_student_fpn_three_stage.pbs.sh
 ```
 
@@ -96,6 +99,18 @@ That job passes the stage counts directly to
 ```text
 --stage1-epochs 300 --stage2-epochs 200 --stage3-epochs 300
 ```
+
+By default the PBS jobs make stage 3 conservative:
+
+```text
+--stage3-lr 1e-5
+--stage3-train-mode head-only
+--stage3-output-distill-weight 0.1
+```
+
+This fine-tunes the final CPSAM readout head against labels while preserving the
+distilled FPN encoder representation and keeping the student output close to the
+teacher. To allow limited encoder adaptation, set `STAGE3_TRAIN_MODE=adapter-only`.
 
 Set the `#PBS -l walltime=...` line in the single PBS file according to whether
 you are running a short smoke test or the full 300/200/300 epoch schedule. If

@@ -16,6 +16,9 @@ STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 INIT_STUDENT="${INIT_STUDENT:-$OUTPUT_DIR/stage2_output/cpsam_encoder_student_best.pt}"
+STAGE3_LR="${STAGE3_LR:-1e-5}"
+STAGE3_TRAIN_MODE="${STAGE3_TRAIN_MODE:-head-only}"
+STAGE3_OUTPUT_DISTILL_WEIGHT="${STAGE3_OUTPUT_DISTILL_WEIGHT:-0.1}"
 
 cd "$REPO_DIR"
 
@@ -48,6 +51,9 @@ echo "CONDA_ENV=$CONDA_ENV"
 echo "CUDA_MODULE=$CUDA_MODULE"
 echo "STAGE3_FLOW_CACHE_DIR=$STAGE3_FLOW_CACHE_DIR"
 echo "INIT_STUDENT=$INIT_STUDENT"
+echo "STAGE3_LR=$STAGE3_LR"
+echo "STAGE3_TRAIN_MODE=$STAGE3_TRAIN_MODE"
+echo "STAGE3_OUTPUT_DISTILL_WEIGHT=$STAGE3_OUTPUT_DISTILL_WEIGHT"
 
 python "$REPO_DIR/tools/train_cpsam_student_fpn_three_stage.py" \
     --train-root-dirs ${TRAIN_ROOT_DIRS} \
@@ -56,6 +62,9 @@ python "$REPO_DIR/tools/train_cpsam_student_fpn_three_stage.py" \
     --stage1-epochs 0 \
     --stage2-epochs 0 \
     --stage3-epochs 300 \
+    --stage3-lr "$STAGE3_LR" \
+    --stage3-train-mode "$STAGE3_TRAIN_MODE" \
+    --stage3-output-distill-weight "$STAGE3_OUTPUT_DISTILL_WEIGHT" \
     --steps-per-epoch "${STEPS_PER_EPOCH}" \
     --batch-size "${BATCH_SIZE}" \
     --num-workers "${NUM_WORKERS}" \
