@@ -1,23 +1,23 @@
 #!/bin/bash
 #PBS -N cpsam_fpn_3stage
 #PBS -l select=1:ncpus=16:ngpus=1:mem=24gb
-#PBS -l walltime=5:00:00
+#PBS -l walltime=24:00:00
 #PBS -j oe
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose}"
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
 TRAIN_ROOT_DIRS="${TRAIN_ROOT_DIRS:-$HOME/FoundationTrain}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/FoundationTrain/distilled_cpsam_encoder_fpn_three_stage}"
-CONDA_ENV="${CONDA_ENV:-cpsam_foundation310}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 STAGE3_FLOW_CACHE_DIR="${STAGE3_FLOW_CACHE_DIR:-${EPHEMERAL:-$OUTPUT_DIR}/cpsam_fpn_supervised_flow_cache}"
 
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-300}"
-STAGE2_EPOCHS="${STAGE2_EPOCHS:-200}"
-STAGE3_EPOCHS="${STAGE3_EPOCHS:-300}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-100}"
+STAGE2_EPOCHS="${STAGE2_EPOCHS:-100}"
+STAGE3_EPOCHS="${STAGE3_EPOCHS:-100}"
 STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
 cd "$REPO_DIR"
