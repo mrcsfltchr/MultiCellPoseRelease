@@ -2,7 +2,7 @@
 #PBS -N cpsam_finetune
 #PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
 #PBS -l walltime=72:00:00
-#PBS -j oe
+#PBS -koed
 
 set -euo pipefail
 
