@@ -341,26 +341,45 @@ def records_for_split(records: Sequence[dict], split: str) -> list[dict]:
     return [row for row in records if row["split"] == split]
 
 
-def balance_training_records(records: Sequence[dict], mode: str, seed: int) -> list[dict]:
+def source_balanced_probs(records: Sequence[dict], mode: str) -> np.ndarray | None:
     if mode == "none":
-        return list(records)
+        return None
     if mode != "source":
         raise ValueError("--balance-mode must be 'source' or 'none'")
+    by_group: dict[str, int] = {}
+    for row in records:
+        by_group[row["source_group"]] = by_group.get(row["source_group"], 0) + 1
+    if not records or not by_group:
+        return None
+    n_groups = len(by_group)
+    probs = np.array(
+        [1.0 / (n_groups * by_group[row["source_group"]]) for row in records],
+        dtype=np.float64,
+    )
+    probs /= probs.sum()
+    return probs
+
+
+def limit_records(records: Sequence[dict], limit: int, seed: int) -> list[dict]:
+    records = list(records)
+    if limit <= 0 or len(records) <= limit:
+        return records
     rng = random.Random(seed)
     by_group: dict[str, list[dict]] = {}
     for row in records:
-        by_group.setdefault(row["source_group"], []).append(dict(row))
-    if not by_group:
-        return []
-    target = max(len(rows) for rows in by_group.values())
-    balanced: list[dict] = []
-    for group, rows in sorted(by_group.items()):
-        balanced.extend(rows)
-        deficit = target - len(rows)
-        if deficit > 0:
-            balanced.extend(rng.choice(rows) for _ in range(deficit))
-    rng.shuffle(balanced)
-    return balanced
+        by_group.setdefault(row["source_group"], []).append(row)
+    selected: list[dict] = []
+    groups = sorted(by_group)
+    per_group = max(1, limit // max(1, len(groups)))
+    for group in groups:
+        rows = list(by_group[group])
+        rng.shuffle(rows)
+        selected.extend(rows[: min(per_group, len(rows))])
+    remaining = [row for row in records if row not in selected]
+    rng.shuffle(remaining)
+    selected.extend(remaining[: max(0, limit - len(selected))])
+    rng.shuffle(selected)
+    return selected[:limit]
 
 
 def load_records(records: Sequence[dict]) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[str]]:
@@ -428,6 +447,9 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--seg-loss-weight", type=float, default=0.1)
     parser.add_argument("--unfreeze-blocks", type=int, default=9)
     parser.add_argument("--balance-mode", default="source", choices=("source", "none"))
+    parser.add_argument("--max-train-records", type=int, default=0, help="Optional cap on unique training records loaded into memory.")
+    parser.add_argument("--max-val-records", type=int, default=0, help="Optional cap on validation records loaded into memory.")
+    parser.add_argument("--nimg-per-epoch", type=int, default=0, help="Images sampled per epoch. Defaults to number of unique loaded training records.")
     parser.add_argument("--use-validation-as-test", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -469,16 +491,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_records = records_for_split(manifest.records, "train")
     val_records = records_for_split(manifest.records, "val")
     test_records = records_for_split(manifest.records, "test")
-    balanced_train_records = balance_training_records(train_records, args.balance_mode, args.seed)
-    print(f"training records after balance={args.balance_mode}: {len(train_records)} -> {len(balanced_train_records)}")
+    train_records_loaded = limit_records(train_records, args.max_train_records, args.seed)
+    val_records_loaded = limit_records(val_records, args.max_val_records, args.seed + 1)
+    train_probs = source_balanced_probs(train_records_loaded, args.balance_mode)
+    print(f"training records after cap: {len(train_records)} -> {len(train_records_loaded)}")
+    if train_probs is not None:
+        print(f"source-balanced sampling enabled across {len(set(row['source_group'] for row in train_records_loaded))} groups")
+    else:
+        print("source-balanced sampling disabled")
     print(f"held-out validation records: {len(val_records)}")
     print(f"held-out test records: {len(test_records)}")
 
     if args.dry_run:
         return 0
 
-    train_data, train_labels, train_files, train_invalid = load_records(balanced_train_records)
-    val_data, val_labels, val_files, val_invalid = load_records(val_records)
+    train_data, train_labels, train_files, train_invalid = load_records(train_records_loaded)
+    val_data, val_labels, val_files, val_invalid = load_records(val_records_loaded)
     if not train_data:
         raise ValueError("No valid training data loaded.")
 
@@ -505,6 +533,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         net,
         train_data=train_data,
         train_labels=train_labels,
+        train_probs=train_probs,
         test_data=val_data if args.use_validation_as_test and val_data else None,
         test_labels=val_labels if args.use_validation_as_test and val_labels else None,
         train_files=None,
@@ -516,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rescale=False,
         scale_range=args.scale_range,
         save_path=str(output_dir),
-        nimg_per_epoch=len(train_data),
+        nimg_per_epoch=args.nimg_per_epoch if args.nimg_per_epoch > 0 else len(train_data),
         nimg_test_per_epoch=len(val_data) if args.use_validation_as_test and val_data else 0,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
