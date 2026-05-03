@@ -14,6 +14,9 @@ CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 
 EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-24}"
+MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
+MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
+NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
 UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-9}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 VAL_RATIO="${VAL_RATIO:-0.1}"
@@ -50,6 +53,9 @@ echo "CONDA_ENV=$CONDA_ENV"
 echo "CUDA_MODULE=$CUDA_MODULE"
 echo "EPOCHS=$EPOCHS"
 echo "BATCH_SIZE=$BATCH_SIZE"
+echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
+echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
+echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
 echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
 
 python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
@@ -57,6 +63,9 @@ python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
     --output-dir "$OUTPUT_DIR" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
+    --max-train-records "$MAX_TRAIN_RECORDS" \
+    --max-val-records "$MAX_VAL_RECORDS" \
+    --nimg-per-epoch "$NIMG_PER_EPOCH" \
     --learning-rate "$LEARNING_RATE" \
     --unfreeze-blocks "$UNFREEZE_BLOCKS" \
     --val-ratio "$VAL_RATIO" \
