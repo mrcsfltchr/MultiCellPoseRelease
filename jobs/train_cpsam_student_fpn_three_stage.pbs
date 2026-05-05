@@ -1,21 +1,22 @@
 #!/bin/bash
 #PBS -N cpsam_fpn_3stage
-#PBS -l select=1:ncpus=16:ngpus=1:mem=24gb
-#PBS -l walltime=5:00:00
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l walltime=72:00:00
 #PBS -j oe
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose}"
-TRAIN_ROOT_DIRS="${TRAIN_ROOT_DIRS:-$HOME/FoundationTrain}"
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+TRAIN_ROOT_DIRS="${TRAIN_ROOT_DIRS:-$HOME/FoundationTrain $HOME/cpsamOODtest/DistillTrain}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/FoundationTrain/distilled_cpsam_encoder_fpn_three_stage}"
-CONDA_ENV="${CONDA_ENV:-cpsam_foundation310}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 STAGE3_FLOW_CACHE_DIR="${STAGE3_FLOW_CACHE_DIR:-${EPHEMERAL:-$OUTPUT_DIR}/cpsam_fpn_supervised_flow_cache}"
+TEACHER_MODEL="${TEACHER_MODEL:-cpsam}"
 
-STAGE1_EPOCHS="${STAGE1_EPOCHS:-300}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-400}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-200}"
-STAGE3_EPOCHS="${STAGE3_EPOCHS:-300}"
+STAGE3_EPOCHS="${STAGE3_EPOCHS:-50}"
 STAGE3_LR="${STAGE3_LR:-1e-5}"
 STAGE3_TRAIN_MODE="${STAGE3_TRAIN_MODE:-head-only}"
 STAGE3_OUTPUT_DISTILL_WEIGHT="${STAGE3_OUTPUT_DISTILL_WEIGHT:-0.1}"
@@ -42,6 +43,10 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$STAGE3_FLOW_CACHE_DIR"
+if [ "$TEACHER_MODEL" != "cpsam" ] && [ ! -f "$TEACHER_MODEL" ]; then
+    echo "ERROR: TEACHER_MODEL does not exist: $TEACHER_MODEL"
+    exit 2
+fi
 
 echo "Job ID: ${PBS_JOBID}"
 echo "Node: $(hostname)"
@@ -53,6 +58,7 @@ echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "CONDA_ENV=$CONDA_ENV"
 echo "CUDA_MODULE=$CUDA_MODULE"
 echo "STAGE3_FLOW_CACHE_DIR=$STAGE3_FLOW_CACHE_DIR"
+echo "TEACHER_MODEL=$TEACHER_MODEL"
 echo "STAGE1_EPOCHS=$STAGE1_EPOCHS"
 echo "STAGE2_EPOCHS=$STAGE2_EPOCHS"
 echo "STAGE3_EPOCHS=$STAGE3_EPOCHS"
@@ -63,6 +69,7 @@ echo "STAGE3_OUTPUT_DISTILL_WEIGHT=$STAGE3_OUTPUT_DISTILL_WEIGHT"
 python "$REPO_DIR/tools/train_cpsam_student_fpn_three_stage.py" \
     --train-root-dirs ${TRAIN_ROOT_DIRS} \
     --output-dir "$OUTPUT_DIR" \
+    --cpsam-model "$TEACHER_MODEL" \
     --stage1-epochs "$STAGE1_EPOCHS" \
     --stage2-epochs "$STAGE2_EPOCHS" \
     --stage3-epochs "$STAGE3_EPOCHS" \
