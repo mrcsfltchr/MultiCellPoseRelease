@@ -98,6 +98,72 @@ def _safe_mean(values: Sequence[float]) -> float | None:
     return float(np.mean(finite)) if finite else None
 
 
+def _label_overlap(masks_true: np.ndarray, masks_pred: np.ndarray) -> np.ndarray:
+    true = masks_true.astype(np.int64, copy=False).ravel()
+    pred = masks_pred.astype(np.int64, copy=False).ravel()
+    n_pred = int(pred.max()) + 1 if pred.size else 1
+    n_true = int(true.max()) + 1 if true.size else 1
+    encoded = true * n_pred + pred
+    overlap = np.bincount(encoded, minlength=n_true * n_pred)
+    return overlap.reshape((n_true, n_pred))
+
+
+def aggregated_jaccard_index_one(masks_true: np.ndarray, masks_pred: np.ndarray) -> float:
+    masks_true = masks_true.astype(np.int32, copy=False)
+    masks_pred = masks_pred.astype(np.int32, copy=False)
+    union = int(np.logical_or(masks_true > 0, masks_pred > 0).sum())
+    if union == 0:
+        return 1.0
+    if int(masks_true.max()) == 0 or int(masks_pred.max()) == 0:
+        return 0.0
+    _iout, preds = metrics.mask_ious(masks_true, masks_pred)
+    inds = np.arange(0, int(masks_true.max()), 1, int)
+    matched = preds > 0
+    if not np.any(matched):
+        return 0.0
+    overlap = _label_overlap(masks_true, masks_pred)
+    matched_overlap = overlap[inds[matched] + 1, preds[matched].astype(int)]
+    return float(matched_overlap.sum() / union)
+
+
+def _summary_payload(args, records: Sequence[dict], rows: Sequence[dict], failures: Sequence[str], thresholds: Sequence[float]) -> dict:
+    by_view: dict[str, list[dict]] = {}
+    for row in rows:
+        by_view.setdefault(str(row["channel_view"]), []).append(row)
+    return {
+        "model_path": str(args.model_path),
+        "split_manifest": str(args.split_manifest),
+        "split": args.split,
+        "n_records_requested": len(records),
+        "n_channel_views_evaluated": len(rows),
+        "n_failures": len(failures),
+        "failures": list(failures[:50]),
+        "thresholds": list(thresholds),
+        "overall": {
+            "aji_mean": _safe_mean([row["aji"] for row in rows]),
+            **{
+                f"ap_{threshold:g}_mean": _safe_mean(
+                    [row[f"ap_{threshold:g}".replace(".", "p")] for row in rows]
+                )
+                for threshold in thresholds
+            },
+        },
+        "by_channel_view": {
+            view: {
+                "n": len(view_rows),
+                "aji_mean": _safe_mean([row["aji"] for row in view_rows]),
+                **{
+                    f"ap_{threshold:g}_mean": _safe_mean(
+                        [row[f"ap_{threshold:g}".replace(".", "p")] for row in view_rows]
+                    )
+                    for threshold in thresholds
+                },
+            }
+            for view, view_rows in sorted(by_view.items())
+        },
+    }
+
+
 def evaluate(args) -> tuple[Path, Path]:
     split_manifest = load_split_manifest(Path(args.split_manifest))
     records = records_for_split(split_manifest.records, args.split)
@@ -163,7 +229,7 @@ def evaluate(args) -> tuple[Path, Path]:
                     [mask_pred],
                     threshold=thresholds,
                 )
-                aji = metrics.aggregated_jaccard_index([mask_true], [mask_pred])[0]
+                aji = aggregated_jaccard_index_one(mask_true, mask_pred)
                 metric_row = {
                     "split": args.split,
                     "image": row["image"],
@@ -189,8 +255,17 @@ def evaluate(args) -> tuple[Path, Path]:
         if index % 50 == 0:
             print(f"evaluated {index}/{len(records)} records ({len(rows)} channel views)")
 
+    summary = _summary_payload(args, records, rows, failures, thresholds)
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     if not rows:
-        raise ValueError("No evaluation rows were produced.")
+        print(f"wrote failure summary: {json_path}")
+        print("No evaluation rows were produced. First failures:")
+        for failure in failures[:20]:
+            print(f"  {failure}")
+        raise ValueError(
+            f"No evaluation rows were produced. {len(failures)} records failed; "
+            f"see {json_path}"
+        )
 
     fieldnames = list(rows[0].keys())
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -198,41 +273,6 @@ def evaluate(args) -> tuple[Path, Path]:
         writer.writeheader()
         writer.writerows(rows)
 
-    by_view: dict[str, list[dict]] = {}
-    for row in rows:
-        by_view.setdefault(str(row["channel_view"]), []).append(row)
-    summary = {
-        "model_path": str(args.model_path),
-        "split_manifest": str(args.split_manifest),
-        "split": args.split,
-        "n_records_requested": len(records),
-        "n_channel_views_evaluated": len(rows),
-        "n_failures": len(failures),
-        "failures": failures[:50],
-        "thresholds": thresholds,
-        "overall": {
-            "aji_mean": _safe_mean([row["aji"] for row in rows]),
-            **{
-                f"ap_{threshold:g}_mean": _safe_mean(
-                    [row[f"ap_{threshold:g}".replace(".", "p")] for row in rows]
-                )
-                for threshold in thresholds
-            },
-        },
-        "by_channel_view": {
-            view: {
-                "n": len(view_rows),
-                "aji_mean": _safe_mean([row["aji"] for row in view_rows]),
-                **{
-                    f"ap_{threshold:g}_mean": _safe_mean(
-                        [row[f"ap_{threshold:g}".replace(".", "p")] for row in view_rows]
-                    )
-                    for threshold in thresholds
-                },
-            }
-            for view, view_rows in sorted(by_view.items())
-        },
-    }
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"wrote per-image metrics: {csv_path}")
     print(f"wrote summary metrics: {json_path}")
