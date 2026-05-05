@@ -17,6 +17,11 @@ BATCH_SIZE="${BATCH_SIZE:-24}"
 MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
 MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
 NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
+NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
+NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/cpsam_finetune_npz_cache}"
+CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
+MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
+CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-true}"
 UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-9}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 VAL_RATIO="${VAL_RATIO:-0.1}"
@@ -41,6 +46,11 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 mkdir -p "$OUTPUT_DIR"
+if [ "$CHANNEL_SAMPLING_VAL" = "true" ] || [ "$CHANNEL_SAMPLING_VAL" = "1" ] || [ "$CHANNEL_SAMPLING_VAL" = "yes" ]; then
+    CHANNEL_SAMPLING_VAL_FLAG="--channel-sampling-val"
+else
+    CHANNEL_SAMPLING_VAL_FLAG="--no-channel-sampling-val"
+fi
 
 echo "Job ID: ${PBS_JOBID}"
 echo "Node: $(hostname)"
@@ -56,6 +66,11 @@ echo "BATCH_SIZE=$BATCH_SIZE"
 echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
 echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
 echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
+echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
+echo "NPZ_CACHE_DIR=$NPZ_CACHE_DIR"
+echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
+echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
+echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
 echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
 
 python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
@@ -66,6 +81,11 @@ python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
     --max-train-records "$MAX_TRAIN_RECORDS" \
     --max-val-records "$MAX_VAL_RECORDS" \
     --nimg-per-epoch "$NIMG_PER_EPOCH" \
+    --npz-mask-channel "$NPZ_MASK_CHANNEL" \
+    --npz-cache-dir "$NPZ_CACHE_DIR" \
+    --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
+    --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
+    "$CHANNEL_SAMPLING_VAL_FLAG" \
     --learning-rate "$LEARNING_RATE" \
     --unfreeze-blocks "$UNFREEZE_BLOCKS" \
     --val-ratio "$VAL_RATIO" \

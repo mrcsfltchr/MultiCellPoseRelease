@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -40,7 +43,6 @@ from guv_app.services.training_dataset_service import _load_seg_npy_compat
 from tools.train_cpsam_encoder_distill import (
     FrameRef,
     is_candidate_image_file,
-    to_channels_last_3,
 )
 from tools.train_cpsam_student_three_stage import _image_label_stems
 
@@ -89,6 +91,68 @@ NPZ_IMAGE_KEYS = ("x", "images", "image", "imgs")
 NPZ_MASK_KEYS = ("y", "masks", "mask", "labels", "label")
 
 
+def to_channels_last_preserve(image: np.ndarray) -> np.ndarray:
+    arr = np.squeeze(np.asarray(image))
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    elif arr.ndim == 3:
+        if arr.shape[0] <= 8 and arr.shape[1] > 8 and arr.shape[2] > 8:
+            arr = np.moveaxis(arr, 0, -1)
+        elif arr.shape[-1] > 8:
+            # Treat first plane as stack/time when the last dimension cannot be channels.
+            arr = arr[0, ..., None] if arr.shape[0] > 8 else arr[..., :1]
+    else:
+        while arr.ndim > 3:
+            arr = arr[0]
+        return to_channels_last_preserve(arr)
+    return arr.astype(np.float32, copy=False)
+
+
+def make_three_channel_view(image: np.ndarray, channels: tuple[int, ...] | None) -> np.ndarray:
+    arr = to_channels_last_preserve(image)
+    n_channels = arr.shape[-1]
+    if channels is None:
+        selected = arr[..., : min(3, n_channels)]
+    else:
+        selected = arr[..., list(channels)]
+    if selected.ndim == 2:
+        selected = selected[..., None]
+    if selected.shape[-1] == 1:
+        selected = np.repeat(selected, 3, axis=-1)
+    elif selected.shape[-1] == 2:
+        selected = np.concatenate([selected, selected[..., :1]], axis=-1)
+    elif selected.shape[-1] > 3:
+        selected = selected[..., :3]
+    return selected.astype(np.float32, copy=False)
+
+
+def channel_view_specs(
+    image: np.ndarray,
+    mode: str,
+    max_all_channel_combos: int,
+    rng: random.Random,
+) -> list[tuple[str, tuple[int, ...] | None]]:
+    n_channels = to_channels_last_preserve(image).shape[-1]
+    if mode == "none" or n_channels <= 1:
+        return [("all", None)]
+    if mode != "single-and-all":
+        raise ValueError("--channel-sampling-mode must be 'single-and-all' or 'none'")
+
+    all_name = "all" if n_channels <= 3 else "all_first3"
+    specs: list[tuple[str, tuple[int, ...] | None]] = [(all_name, None)]
+    specs.extend((f"ch{idx}", (idx,)) for idx in range(n_channels))
+    if n_channels > 3 and max_all_channel_combos > 0:
+        combos = set()
+        attempts = max_all_channel_combos * 8
+        while len(combos) < max_all_channel_combos and attempts > 0:
+            combo = tuple(sorted(rng.sample(range(n_channels), 3)))
+            if combo != tuple(range(3)):
+                combos.add(combo)
+            attempts -= 1
+        specs.extend((f"combo{','.join(map(str, combo))}", combo) for combo in sorted(combos))
+    return specs
+
+
 def _pick_npz_key(keys: Sequence[str], candidates: Sequence[str]) -> str | None:
     lower_to_key = {key.lower(): key for key in keys}
     for candidate in candidates:
@@ -101,6 +165,17 @@ def _pick_npz_key(keys: Sequence[str], candidates: Sequence[str]) -> str | None:
     return None
 
 
+def _npz_member_shape(path: Path, key: str) -> tuple[int, ...] | None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            with archive.open(f"{key}.npy") as member:
+                version = np.lib.format.read_magic(member)
+                shape, _fortran_order, _dtype = np.lib.format._read_array_header(member, version)
+                return tuple(int(dim) for dim in shape)
+    except Exception:
+        return None
+
+
 def inspect_npz_dataset(path: Path) -> tuple[str, str, int] | None:
     try:
         with np.load(path, allow_pickle=True, mmap_mode="r") as data:
@@ -110,11 +185,18 @@ def inspect_npz_dataset(path: Path) -> tuple[str, str, int] | None:
             if image_key is None or mask_key is None:
                 print(f"warning: could not infer image/mask keys in {path}; keys={keys}")
                 return None
-            n_images = int(len(data[image_key]))
-            if int(len(data[mask_key])) != n_images:
+            image_shape = _npz_member_shape(path, image_key)
+            mask_shape = _npz_member_shape(path, mask_key)
+            if image_shape is not None and mask_shape is not None:
+                n_images = int(image_shape[0])
+                n_masks = int(mask_shape[0])
+            else:
+                n_images = int(len(data[image_key]))
+                n_masks = int(len(data[mask_key]))
+            if n_masks != n_images:
                 print(
                     f"warning: image/mask length mismatch in {path}: "
-                    f"{image_key}={len(data[image_key])}, {mask_key}={len(data[mask_key])}"
+                    f"{image_key}={n_images}, {mask_key}={n_masks}"
                 )
                 return None
             return image_key, mask_key, n_images
@@ -132,8 +214,33 @@ def _parse_npz_frame_id(frame_id: str | None) -> tuple[int, str | None, str | No
     return int(parts[0]), parts[1] if len(parts) > 1 else None, parts[2] if len(parts) > 2 else None
 
 
-def load_npz_item(path: str | Path, frame_id: str | None, kind: str) -> np.ndarray:
+def _npz_cache_path(path: Path, key: str, cache_dir: Path) -> Path:
+    digest = hashlib.sha1(f"{path.resolve()}::{key}".encode("utf-8")).hexdigest()[:16]
+    return cache_dir / f"{path.stem}_{key}_{digest}.npy"
+
+
+def _cached_npz_member(path: Path, key: str, cache_dir: str | Path | None) -> Path | None:
+    if not cache_dir:
+        return None
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cached = _npz_cache_path(path, key, cache_root)
+    if cached.exists():
+        return cached
+    tmp = cached.with_suffix(".tmp")
+    member_name = f"{key}.npy"
+    with zipfile.ZipFile(path) as archive:
+        if member_name not in archive.namelist():
+            return None
+        with archive.open(member_name) as src, tmp.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+    tmp.replace(cached)
+    return cached
+
+
+def load_npz_item(path: str | Path, frame_id: str | None, kind: str, npz_cache_dir: str | Path | None = None) -> np.ndarray:
     index, image_key_hint, mask_key_hint = _parse_npz_frame_id(frame_id)
+    path = Path(path)
     with np.load(path, allow_pickle=True, mmap_mode="r") as data:
         keys = list(data.keys())
         if kind == "image":
@@ -142,7 +249,13 @@ def load_npz_item(path: str | Path, frame_id: str | None, kind: str) -> np.ndarr
             key = mask_key_hint or _pick_npz_key(keys, NPZ_MASK_KEYS)
         if key is None:
             raise ValueError(f"Could not infer {kind} key in npz file {path}; keys={keys}")
-        return np.asarray(data[key][index])
+    cached = _cached_npz_member(path, key, npz_cache_dir)
+    if cached is not None:
+        return np.asarray(np.load(cached, mmap_mode="r")[index])
+    raise ValueError(
+        f"Refusing to load {path}:{key}[{index}] directly because .npz archives are not "
+        "random-access. Provide --npz-cache-dir on fast scratch/ephemeral storage."
+    )
 
 
 def find_label_path(ref: FrameRef) -> Path | None:
@@ -304,11 +417,51 @@ def load_split_manifest(path: Path) -> SplitManifest:
     )
 
 
-def load_mask(label_path: str | Path, frame_id: str | None = None) -> np.ndarray:
+def coerce_mask_2d(masks: np.ndarray, *, npz_mask_channel: str, label_path: Path, allow_channel_select: bool) -> np.ndarray:
+    masks = np.squeeze(masks)
+    if masks.ndim == 3 and not allow_channel_select and masks.shape[-1] in (3, 4):
+        if np.array_equal(masks[..., 0], masks[..., 1]) and np.array_equal(masks[..., 0], masks[..., 2]):
+            masks = masks[..., 0]
+    if masks.ndim == 3 and allow_channel_select:
+        if masks.shape[-1] <= 8:
+            if npz_mask_channel == "first":
+                masks = masks[..., 0]
+            elif npz_mask_channel == "last":
+                masks = masks[..., -1]
+            elif npz_mask_channel == "max":
+                masks = np.max(masks, axis=-1)
+            else:
+                try:
+                    masks = masks[..., int(npz_mask_channel)]
+                except Exception as exc:
+                    raise ValueError(f"Invalid --npz-mask-channel {npz_mask_channel!r}") from exc
+        elif masks.shape[0] <= 8:
+            if npz_mask_channel == "first":
+                masks = masks[0]
+            elif npz_mask_channel == "last":
+                masks = masks[-1]
+            elif npz_mask_channel == "max":
+                masks = np.max(masks, axis=0)
+            else:
+                try:
+                    masks = masks[int(npz_mask_channel)]
+                except Exception as exc:
+                    raise ValueError(f"Invalid --npz-mask-channel {npz_mask_channel!r}") from exc
+    if masks.ndim != 2:
+        raise ValueError(f"Expected 2D mask labels in {label_path}, got {masks.shape}")
+    return masks
+
+
+def load_mask(
+    label_path: str | Path,
+    frame_id: str | None = None,
+    npz_mask_channel: str = "last",
+    npz_cache_dir: str | Path | None = None,
+) -> np.ndarray:
     label_path = Path(label_path)
     suffix = label_path.suffix.lower()
     if suffix == ".npz":
-        masks = load_npz_item(label_path, frame_id, "mask")
+        masks = load_npz_item(label_path, frame_id, "mask", npz_cache_dir=npz_cache_dir)
     elif suffix == ".npy":
         dat = _load_seg_npy_compat(str(label_path))
         masks = dat.get("masks")
@@ -319,22 +472,30 @@ def load_mask(label_path: str | Path, frame_id: str | None = None) -> np.ndarray
             masks = np.asarray(img)
     else:
         raise ValueError(f"Unsupported label file type: {label_path}")
-    masks = np.squeeze(masks)
-    if masks.ndim != 2:
-        raise ValueError(f"Expected 2D mask labels in {label_path}, got {masks.shape}")
+    masks = coerce_mask_2d(
+        masks,
+        npz_mask_channel=npz_mask_channel,
+        label_path=label_path,
+        allow_channel_select=suffix == ".npz",
+    )
     return masks.astype(np.int32, copy=False)
 
 
-def load_image_ref(image_service: ImageService, image: str, frame_id: str | None) -> np.ndarray:
+def load_image_ref(
+    image_service: ImageService,
+    image: str,
+    frame_id: str | None,
+    npz_cache_dir: str | Path | None = None,
+) -> np.ndarray:
     if Path(image).suffix.lower() == ".npz":
-        return to_channels_last_3(load_npz_item(image, frame_id, "image"))
+        return to_channels_last_preserve(load_npz_item(image, frame_id, "image", npz_cache_dir=npz_cache_dir))
     if frame_id:
         arr = image_service.load_frame(image, frame_id)
     else:
         arr = image_service.load_image(image)
     if arr is None:
         raise ValueError(f"Could not load image/frame: {image}::{frame_id}")
-    return to_channels_last_3(np.asarray(arr))
+    return to_channels_last_preserve(np.asarray(arr))
 
 
 def records_for_split(records: Sequence[dict], split: str) -> list[dict]:
@@ -382,18 +543,41 @@ def limit_records(records: Sequence[dict], limit: int, seed: int) -> list[dict]:
     return selected[:limit]
 
 
-def load_records(records: Sequence[dict]) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[str]]:
+def load_records(
+    records: Sequence[dict],
+    npz_mask_channel: str,
+    channel_sampling_mode: str,
+    max_all_channel_combos: int,
+    seed: int,
+    npz_cache_dir: str | Path | None,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[dict], list[str]]:
     image_service = ImageService()
+    rng = random.Random(seed)
     data: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     files: list[str] = []
+    valid_records: list[dict] = []
     invalid: list[str] = []
     for index, row in enumerate(records, start=1):
         frame_id = row.get("frame_id") or None
         try:
-            data.append(load_image_ref(image_service, row["image"], frame_id))
-            labels.append(load_mask(row["label"], frame_id=frame_id))
-            files.append(f"{row['image']}::{frame_id}" if frame_id else row["image"])
+            image = load_image_ref(image_service, row["image"], frame_id, npz_cache_dir=npz_cache_dir)
+            mask = load_mask(
+                row["label"],
+                frame_id=frame_id,
+                npz_mask_channel=npz_mask_channel,
+                npz_cache_dir=npz_cache_dir,
+            )
+            specs = channel_view_specs(image, channel_sampling_mode, max_all_channel_combos, rng)
+            for view_name, channels in specs:
+                data.append(make_three_channel_view(image, channels))
+                labels.append(mask)
+                file_ref = f"{row['image']}::{frame_id}" if frame_id else row["image"]
+                files.append(f"{file_ref}::channels={view_name}")
+                valid_row = dict(row)
+                valid_row["channel_view"] = view_name
+                valid_row["source_group"] = f"{row['source_group']}|channels:{view_name}"
+                valid_records.append(valid_row)
         except Exception as exc:
             invalid.append(f"{row.get('image')}::{frame_id or ''} label={row.get('label')} error={exc}")
         if index % 250 == 0:
@@ -402,7 +586,7 @@ def load_records(records: Sequence[dict]) -> tuple[list[np.ndarray], list[np.nda
         print(f"skipped {len(invalid)} invalid records")
         for line in invalid[:20]:
             print(f"  {line}")
-    return data, labels, files, invalid
+    return data, labels, files, valid_records, invalid
 
 
 def summarize(records: Sequence[dict]) -> None:
@@ -450,6 +634,34 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max-train-records", type=int, default=0, help="Optional cap on unique training records loaded into memory.")
     parser.add_argument("--max-val-records", type=int, default=0, help="Optional cap on validation records loaded into memory.")
     parser.add_argument("--nimg-per-epoch", type=int, default=0, help="Images sampled per epoch. Defaults to number of unique loaded training records.")
+    parser.add_argument(
+        "--channel-sampling-mode",
+        default="single-and-all",
+        choices=("single-and-all", "none"),
+        help="For multichannel images, train on all available input channels plus each single channel.",
+    )
+    parser.add_argument(
+        "--max-all-channel-combos",
+        type=int,
+        default=2,
+        help="For images with more than 3 channels, add this many random 3-channel combination views in addition to single channels.",
+    )
+    parser.add_argument(
+        "--channel-sampling-val",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the same channel view expansion to validation records.",
+    )
+    parser.add_argument(
+        "--npz-mask-channel",
+        default="last",
+        help="For 3D mask arrays in .npz datasets, select first, last, max, or a numeric channel index.",
+    )
+    parser.add_argument(
+        "--npz-cache-dir",
+        default=None,
+        help="Directory for extracted .npz member .npy files. Required to train from large .npz archives efficiently.",
+    )
     parser.add_argument("--use-validation-as-test", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -493,22 +705,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     test_records = records_for_split(manifest.records, "test")
     train_records_loaded = limit_records(train_records, args.max_train_records, args.seed)
     val_records_loaded = limit_records(val_records, args.max_val_records, args.seed + 1)
-    train_probs = source_balanced_probs(train_records_loaded, args.balance_mode)
     print(f"training records after cap: {len(train_records)} -> {len(train_records_loaded)}")
-    if train_probs is not None:
-        print(f"source-balanced sampling enabled across {len(set(row['source_group'] for row in train_records_loaded))} groups")
-    else:
-        print("source-balanced sampling disabled")
     print(f"held-out validation records: {len(val_records)}")
     print(f"held-out test records: {len(test_records)}")
 
     if args.dry_run:
         return 0
 
-    train_data, train_labels, train_files, train_invalid = load_records(train_records_loaded)
-    val_data, val_labels, val_files, val_invalid = load_records(val_records_loaded)
+    train_data, train_labels, train_files, valid_train_records, train_invalid = load_records(
+        train_records_loaded,
+        args.npz_mask_channel,
+        args.channel_sampling_mode,
+        args.max_all_channel_combos,
+        args.seed,
+        args.npz_cache_dir,
+    )
+    val_data, val_labels, val_files, valid_val_records, val_invalid = load_records(
+        val_records_loaded,
+        args.npz_mask_channel,
+        args.channel_sampling_mode if args.channel_sampling_val else "none",
+        args.max_all_channel_combos,
+        args.seed + 1,
+        args.npz_cache_dir,
+    )
     if not train_data:
         raise ValueError("No valid training data loaded.")
+    train_probs = source_balanced_probs(valid_train_records, args.balance_mode)
+    if train_probs is not None:
+        print(f"source-balanced sampling enabled across {len(set(row['source_group'] for row in valid_train_records))} valid groups")
+    else:
+        print("source-balanced sampling disabled")
+    print(f"valid training records loaded: {len(train_data)}/{len(train_records_loaded)}")
+    print(f"valid validation records loaded: {len(val_data)}/{len(val_records_loaded)}")
+    if len(train_data) != len(train_labels):
+        raise ValueError(f"Internal loader error: train data/labels length mismatch ({len(train_data)} != {len(train_labels)})")
+    if train_probs is not None and len(train_probs) != len(train_data):
+        raise ValueError(f"Internal loader error: train probabilities/data length mismatch ({len(train_probs)} != {len(train_data)})")
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     net = build_net(args.base_model, device)
@@ -563,8 +795,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "validation_losses": val_losses.tolist() if hasattr(val_losses, "tolist") else val_losses,
                 "split_manifest": str(split_manifest_path),
                 "n_train_records": len(train_data),
+                "n_requested_train_records": len(train_records_loaded),
                 "n_val_records": len(val_data),
+                "n_requested_val_records": len(val_records_loaded),
                 "n_test_records": len(test_records),
+                "npz_mask_channel": args.npz_mask_channel,
+                "npz_cache_dir": args.npz_cache_dir,
+                "channel_sampling_mode": args.channel_sampling_mode,
+                "max_all_channel_combos": args.max_all_channel_combos,
+                "channel_sampling_val": args.channel_sampling_val,
                 "invalid_train_records": train_invalid,
                 "invalid_val_records": val_invalid,
             },
