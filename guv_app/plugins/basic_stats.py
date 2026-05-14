@@ -78,6 +78,9 @@ class BasicStatsPlugin(AnalysisPlugin):
         flat_labels = labels.ravel()
         area = np.bincount(flat_labels, minlength=max_label + 1)
         nonzero = area > 0
+        mask_ids = np.flatnonzero(area[1:] > 0).astype(np.int32) + 1
+        if mask_ids.size == 0:
+            return pd.DataFrame()
 
         # Perimeter via 4-connectivity boundary detection on 2D labels
         padded = np.pad(labels, 1, mode="edge")
@@ -90,11 +93,10 @@ class BasicStatsPlugin(AnalysisPlugin):
         )
         perimeter = np.bincount(center[boundary], minlength=max_label + 1).astype(np.float64)
 
-        mask_ids = np.arange(1, max_label + 1, dtype=np.int32)
         df = pd.DataFrame({
             "mask_id": mask_ids,
-            "area": area[1:],
-            "perimeter": perimeter[1:],
+            "area": area[mask_ids],
+            "perimeter": perimeter[mask_ids],
         })
         bg_labels = _make_local_background_labels(labels, bg_inner_gap, bg_outer_radius)
 
@@ -107,17 +109,19 @@ class BasicStatsPlugin(AnalysisPlugin):
             if per_channel is not None and len(per_channel) > 1:
                 channel_slices = _extract_channel_slices(image, labels)
                 overall = np.mean(np.stack(per_channel, axis=0), axis=0)
-                df["mean_intensity"] = overall
+                present_idx = mask_ids - 1
+                df["mean_intensity"] = overall[present_idx]
                 bg_sub_channels = []
                 for c_idx, ch_means in enumerate(per_channel):
-                    df[f"mean_intensity_ch{c_idx + 1}"] = ch_means
+                    ch_means_present = ch_means[present_idx]
+                    df[f"mean_intensity_ch{c_idx + 1}"] = ch_means_present
                     if channel_slices[c_idx] is None:
                         bg_values = np.full(mask_ids.shape, np.nan, dtype=np.float64)
                     else:
                         bg_values = _local_background_values(
                             bg_labels, channel_slices[c_idx], mask_ids, bg_percentile
                         )
-                    bg_sub = ch_means - bg_values
+                    bg_sub = ch_means_present - bg_values
                     bg_sub_channels.append(bg_sub)
                     df[f"mean_intensity_bg_subtracted_ch{c_idx + 1}"] = bg_sub
                 df["mean_intensity_bg_subtracted"] = _nanmean_columns(bg_sub_channels)
@@ -129,11 +133,11 @@ class BasicStatsPlugin(AnalysisPlugin):
                     isum = np.bincount(flat_labels, weights=flat_intensity, minlength=max_label + 1)
                     mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
                     mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
-                    df["mean_intensity"] = mean_intensity[1:]
+                    df["mean_intensity"] = mean_intensity[mask_ids]
                     bg_values = _local_background_values(
                         bg_labels, np.squeeze(intensity_img), mask_ids, bg_percentile
                     )
-                    df["mean_intensity_bg_subtracted"] = mean_intensity[1:] - bg_values
+                    df["mean_intensity_bg_subtracted"] = mean_intensity[mask_ids] - bg_values
                 except ValueError as exc:
                     _logger.warning("Basic Stats: %s", exc)
                     return pd.DataFrame()
@@ -149,11 +153,11 @@ class BasicStatsPlugin(AnalysisPlugin):
             isum = np.bincount(flat_labels, weights=flat_intensity, minlength=max_label + 1)
             mean_intensity = np.zeros(max_label + 1, dtype=np.float64)
             mean_intensity[nonzero] = isum[nonzero] / area[nonzero]
-            df["mean_intensity"] = mean_intensity[1:]
+            df["mean_intensity"] = mean_intensity[mask_ids]
             bg_values = _local_background_values(
                 bg_labels, np.squeeze(intensity_img), mask_ids, bg_percentile
             )
-            df["mean_intensity_bg_subtracted"] = mean_intensity[1:] - bg_values
+            df["mean_intensity_bg_subtracted"] = mean_intensity[mask_ids] - bg_values
             df["intensity_channel_name"] = channel_name
 
         # ── Object ID assignment ─────────────────────────────────────────────
