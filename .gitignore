@@ -43,6 +43,40 @@ models/
 *.log
 *.tmp
 
+# Model distillation/checkpoint outputs
+distill-encoder-test*/
+distilled_cpsam_encoder*/
+cpsam_encoder_student*.pt
+student_*checkpoint*.pt
+*.pt
+*.npy
+supervised_flow_cache/
+stage1_feature/
+stage2_output/
+stage3_supervised/
+test_evaluation_*.csv
+test_evaluation_*.json
+
+# AVI/video fluorescence analysis outputs
+video_object_fluorescence*/
+object_fluorescence*/
+video_fluorescence*/
+avi_fluorescence*/
+track_overlay*/
+tracking_overlay*/
+tracking_analysis*/
+selected_tracking_frames*/
+aligned_condition_difference*/
+control_subtracted_br_regions*/
+trace_distribution*/
+tools/analyze_video_object_fluorescence*.py
+tools/render_*trace*.py
+tools/render_track_overlay.py
+tools/render_selected_tracking_frames.py
+tools/render_aligned_condition_difference.py
+tools/render_control_subtracted_br_regions.py
+video_object_fluorescence_plot.ipynb
+
 # Editor/OS
 .vscode/
 .idea/
