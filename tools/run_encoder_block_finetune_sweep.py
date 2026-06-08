@@ -39,6 +39,14 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     parser.add_argument("--model-prefix", default="guvpose_full")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument(
+        "--batch-size-by-block",
+        default="",
+        help=(
+            "Optional comma-separated overrides such as "
+            "'9:24,12:12,15:8,18:6,full:2'. Keys match --blocks entries."
+        ),
+    )
     parser.add_argument("--bsize", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -76,11 +84,37 @@ def parse_block(block: str, full_value: int) -> tuple[str, int]:
     return f"{value:02d}", value
 
 
+def parse_batch_size_by_block(spec: str) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    if not spec:
+        return overrides
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid --batch-size-by-block item {item!r}; expected key:value")
+        key, value = item.split(":", 1)
+        key = key.strip().lower()
+        if key != "full":
+            key = str(int(key))
+        overrides[key] = int(value)
+    return overrides
+
+
+def batch_size_for_block(block: str, default_batch_size: int, overrides: dict[str, int]) -> int:
+    key = str(block).strip().lower()
+    if key != "full":
+        key = str(int(key))
+    return int(overrides.get(key, default_batch_size))
+
+
 def build_command(
     args: argparse.Namespace,
     extra: list[str],
     block_label: str,
     unfreeze_blocks: int,
+    batch_size: int,
     output_dir: Path,
     split_manifest: Path,
 ) -> list[str]:
@@ -102,7 +136,7 @@ def build_command(
         "--epochs",
         str(args.epochs),
         "--batch-size",
-        str(args.batch_size),
+        str(batch_size),
         "--bsize",
         str(args.bsize),
         "--learning-rate",
@@ -167,16 +201,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     split_manifest = Path(args.split_manifest) if args.split_manifest else output_root / "shared_full_dataset_splits.json"
 
+    batch_overrides = parse_batch_size_by_block(args.batch_size_by_block)
     runs = []
     for block in args.blocks:
         block_label, unfreeze_blocks = parse_block(block, args.full_blocks_value)
+        block_batch_size = batch_size_for_block(block, args.batch_size, batch_overrides)
         output_dir = output_root / f"blocks{block_label}"
         output_dir.mkdir(parents=True, exist_ok=True)
-        cmd = build_command(args, extra, block_label, unfreeze_blocks, output_dir, split_manifest)
+        cmd = build_command(args, extra, block_label, unfreeze_blocks, block_batch_size, output_dir, split_manifest)
         run_meta = {
             "block": str(block),
             "block_label": block_label,
             "unfreeze_blocks_arg": unfreeze_blocks,
+            "batch_size": block_batch_size,
             "output_dir": str(output_dir),
             "model_name": f"{args.model_prefix}_blocks{block_label}",
             "command": cmd,
