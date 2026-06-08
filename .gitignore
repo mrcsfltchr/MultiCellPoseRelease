@@ -50,6 +50,12 @@ supervised_flow_cache/
 *.pth
 *.npy
 
+# Paper/generated analysis outputs
+paper/
+*.png
+*.ipynb
+*.csv
+
 # Editor/OS
 .vscode/
 .idea/

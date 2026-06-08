@@ -60,8 +60,9 @@ image = [
 ]
 gui = [
   "pyqtgraph>=0.12.4",
-  "pyqt6",
-  "pyqt6.sip",
+  "PyQt6>=6.7,<6.10",
+  "PyQt6-Qt6>=6.7,<6.10",
+  "PyQt6-sip>=13.8,<14",
   "qtpy",
   "superqt",
   "nd2",
@@ -102,8 +103,9 @@ all = [
   "pynrrd",
   "readlif",
   "pyqtgraph>=0.12.4",
-  "pyqt6",
-  "pyqt6.sip",
+  "PyQt6>=6.7,<6.10",
+  "PyQt6-Qt6>=6.7,<6.10",
+  "PyQt6-sip>=13.8,<14",
   "qtpy",
   "superqt",
   "grpcio",

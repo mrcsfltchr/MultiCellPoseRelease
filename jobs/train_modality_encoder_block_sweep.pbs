@@ -1,0 +1,138 @@
+#!/bin/bash
+#PBS -N cpsam_mod_block_sweep
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l walltime=120:00:00
+#PBS -koed
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+ROOT_DIR="${ROOT_DIR:-$HOME/cpsamOODtest}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/modality_encoder_block_sweep}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
+
+MODALITIES="${MODALITIES:-Fluorescence Confocal PhaseContrast MultiObject}"
+BLOCKS="${BLOCKS:-9 12 15 18 full}"
+FULL_BLOCKS_VALUE="${FULL_BLOCKS_VALUE:-999}"
+BASE_MODEL="${BASE_MODEL:-cpsam}"
+MODEL_PREFIX="${MODEL_PREFIX:-guvpose}"
+EPOCHS="${EPOCHS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-24}"
+B_SIZE="${B_SIZE:-256}"
+MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
+MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
+NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
+NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
+NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/cpsam_modality_block_sweep_npz_cache}"
+CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
+MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
+CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-true}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+SCALE_RANGE="${SCALE_RANGE:-0.5}"
+SEG_LOSS_WEIGHT="${SEG_LOSS_WEIGHT:-0.1}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+TEST_RATIO="${TEST_RATIO:-0.1}"
+SEED="${SEED:-17}"
+EARLY_STOP="${EARLY_STOP:-false}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-5}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
+REDO_SPLITS="${REDO_SPLITS:-false}"
+
+cd "$REPO_DIR"
+
+module load "$CUDA_MODULE" 2>/dev/null || true
+
+if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+elif [ -x "$HOME/miniforge3/bin/conda" ]; then
+    eval "$($HOME/miniforge3/bin/conda shell.bash hook)"
+else
+    echo "ERROR: conda not found in $HOME/miniconda3 or $HOME/miniforge3"
+    exit 2
+fi
+conda activate "$CONDA_ENV"
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+
+mkdir -p "$OUTPUT_ROOT"
+mkdir -p "$NPZ_CACHE_DIR"
+
+if [ "$CHANNEL_SAMPLING_VAL" = "true" ] || [ "$CHANNEL_SAMPLING_VAL" = "1" ] || [ "$CHANNEL_SAMPLING_VAL" = "yes" ]; then
+    CHANNEL_SAMPLING_VAL_FLAG="--channel-sampling-val"
+else
+    CHANNEL_SAMPLING_VAL_FLAG="--no-channel-sampling-val"
+fi
+
+EXTRA_FLAGS=()
+if [ "$EARLY_STOP" = "true" ] || [ "$EARLY_STOP" = "1" ] || [ "$EARLY_STOP" = "yes" ]; then
+    EXTRA_FLAGS+=("--early-stop")
+fi
+if [ "$REDO_SPLITS" = "true" ] || [ "$REDO_SPLITS" = "1" ] || [ "$REDO_SPLITS" = "yes" ]; then
+    EXTRA_FLAGS+=("--redo-splits")
+fi
+
+echo "Job ID: ${PBS_JOBID}"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+python -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
+echo "REPO_DIR=$REPO_DIR"
+echo "ROOT_DIR=$ROOT_DIR"
+echo "OUTPUT_ROOT=$OUTPUT_ROOT"
+echo "CONDA_ENV=$CONDA_ENV"
+echo "CUDA_MODULE=$CUDA_MODULE"
+echo "MODALITIES=$MODALITIES"
+echo "BLOCKS=$BLOCKS"
+echo "FULL_BLOCKS_VALUE=$FULL_BLOCKS_VALUE"
+echo "BASE_MODEL=$BASE_MODEL"
+echo "MODEL_PREFIX=$MODEL_PREFIX"
+echo "EPOCHS=$EPOCHS"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "B_SIZE=$B_SIZE"
+echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
+echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
+echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
+echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
+echo "NPZ_CACHE_DIR=$NPZ_CACHE_DIR"
+echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
+echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
+echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
+echo "LEARNING_RATE=$LEARNING_RATE"
+echo "EARLY_STOP=$EARLY_STOP"
+echo "EARLY_STOP_PATIENCE=$EARLY_STOP_PATIENCE"
+echo "EARLY_STOP_MIN_DELTA=$EARLY_STOP_MIN_DELTA"
+
+python "$REPO_DIR/tools/run_modality_encoder_block_sweep.py" \
+    --root-dir "$ROOT_DIR" \
+    --output-root "$OUTPUT_ROOT" \
+    --modalities $MODALITIES \
+    --blocks $BLOCKS \
+    --full-blocks-value "$FULL_BLOCKS_VALUE" \
+    --base-model "$BASE_MODEL" \
+    --model-prefix "$MODEL_PREFIX" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --bsize "$B_SIZE" \
+    --learning-rate "$LEARNING_RATE" \
+    --weight-decay "$WEIGHT_DECAY" \
+    --scale-range "$SCALE_RANGE" \
+    --seg-loss-weight "$SEG_LOSS_WEIGHT" \
+    --val-ratio "$VAL_RATIO" \
+    --test-ratio "$TEST_RATIO" \
+    --seed "$SEED" \
+    --max-train-records "$MAX_TRAIN_RECORDS" \
+    --max-val-records "$MAX_VAL_RECORDS" \
+    --nimg-per-epoch "$NIMG_PER_EPOCH" \
+    --balance-mode source \
+    --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
+    --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
+    "$CHANNEL_SAMPLING_VAL_FLAG" \
+    --npz-mask-channel "$NPZ_MASK_CHANNEL" \
+    --npz-cache-dir "$NPZ_CACHE_DIR" \
+    --early-stop-patience "$EARLY_STOP_PATIENCE" \
+    --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+    "${EXTRA_FLAGS[@]}"
+
+echo "Finish: $(date)"
