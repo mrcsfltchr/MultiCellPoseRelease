@@ -18,7 +18,8 @@ FULL_BLOCKS_VALUE="${FULL_BLOCKS_VALUE:-999}"
 BASE_MODEL="${BASE_MODEL:-cpsam}"
 MODEL_PREFIX="${MODEL_PREFIX:-guvpose}"
 EPOCHS="${EPOCHS:-300}"
-BATCH_SIZE="${BATCH_SIZE:-24}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE_BY_BLOCK="${BATCH_SIZE_BY_BLOCK:-9:16,12:8,15:6,18:4,full:2}"
 B_SIZE="${B_SIZE:-256}"
 MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
 MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
@@ -56,6 +57,7 @@ conda activate "$CONDA_ENV"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 mkdir -p "$OUTPUT_ROOT"
 mkdir -p "$NPZ_CACHE_DIR"
@@ -90,6 +92,7 @@ echo "BASE_MODEL=$BASE_MODEL"
 echo "MODEL_PREFIX=$MODEL_PREFIX"
 echo "EPOCHS=$EPOCHS"
 echo "BATCH_SIZE=$BATCH_SIZE"
+echo "BATCH_SIZE_BY_BLOCK=$BATCH_SIZE_BY_BLOCK"
 echo "B_SIZE=$B_SIZE"
 echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
 echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
@@ -114,6 +117,7 @@ python "$REPO_DIR/tools/run_modality_encoder_block_sweep.py" \
     --model-prefix "$MODEL_PREFIX" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
+    --batch-size-by-block "$BATCH_SIZE_BY_BLOCK" \
     --bsize "$B_SIZE" \
     --learning-rate "$LEARNING_RATE" \
     --weight-decay "$WEIGHT_DECAY" \

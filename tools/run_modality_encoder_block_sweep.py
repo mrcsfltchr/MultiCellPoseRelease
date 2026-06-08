@@ -38,6 +38,14 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     parser.add_argument("--model-prefix", default="guvpose")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument(
+        "--batch-size-by-block",
+        default="",
+        help=(
+            "Optional comma-separated overrides such as "
+            "'9:24,12:12,15:8,18:6,full:2'. Keys match --blocks entries."
+        ),
+    )
     parser.add_argument("--bsize", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -75,6 +83,31 @@ def parse_block(block: str, full_value: int) -> tuple[str, int]:
     return f"{value:02d}", value
 
 
+def parse_batch_size_by_block(spec: str) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    if not spec:
+        return overrides
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid --batch-size-by-block item {item!r}; expected key:value")
+        key, value = item.split(":", 1)
+        key = key.strip().lower()
+        if key != "full":
+            key = str(int(key))
+        overrides[key] = int(value)
+    return overrides
+
+
+def batch_size_for_block(block: str, default_batch_size: int, overrides: dict[str, int]) -> int:
+    key = str(block).strip().lower()
+    if key != "full":
+        key = str(int(key))
+    return int(overrides.get(key, default_batch_size))
+
+
 def quote_cmd(cmd: Sequence[str]) -> str:
     return " ".join(f'"{part}"' if any(ch.isspace() for ch in part) else part for part in cmd)
 
@@ -85,6 +118,7 @@ def build_command(
     modality: str,
     block_label: str,
     unfreeze_blocks: int,
+    batch_size: int,
 ) -> tuple[list[str], dict]:
     modality_dir = Path(args.root_dir) / modality
     output_dir = Path(args.output_root) / modality / f"blocks{block_label}"
@@ -108,7 +142,7 @@ def build_command(
         "--epochs",
         str(args.epochs),
         "--batch-size",
-        str(args.batch_size),
+        str(batch_size),
         "--bsize",
         str(args.bsize),
         "--learning-rate",
@@ -165,6 +199,7 @@ def build_command(
         "modality": modality,
         "block_label": block_label,
         "unfreeze_blocks_arg": unfreeze_blocks,
+        "batch_size": batch_size,
         "model_name": model_name,
         "modality_dir": str(modality_dir),
         "output_dir": str(output_dir),
@@ -180,13 +215,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     runs = []
+    batch_overrides = parse_batch_size_by_block(args.batch_size_by_block)
     for modality in args.modalities:
         modality_dir = Path(args.root_dir) / modality
         if not modality_dir.exists():
             raise FileNotFoundError(f"Modality directory does not exist: {modality_dir}")
         for block in args.blocks:
             block_label, unfreeze_blocks = parse_block(block, args.full_blocks_value)
-            cmd, meta = build_command(args, extra, modality, block_label, unfreeze_blocks)
+            block_batch_size = batch_size_for_block(block, args.batch_size, batch_overrides)
+            cmd, meta = build_command(args, extra, modality, block_label, unfreeze_blocks, block_batch_size)
             Path(meta["output_dir"]).mkdir(parents=True, exist_ok=True)
             runs.append(meta)
 
