@@ -50,6 +50,12 @@ supervised_flow_cache/
 *.pth
 *.npy
 
+# Paper/generated analysis outputs
+paper/
+*.png
+*.ipynb
+*.csv
+
 # Editor/OS
 .vscode/
 .idea/
@@ -60,3 +66,13 @@ Thumbs.db
 *.o*
 *.e*
 x:/home/
+
+# Local video-analysis helper scripts
+tools/analyze_video_object_fluorescence.py
+tools/analyze_video_object_fluorescence_cpsam.py
+tools/render_aligned_condition_difference.py
+tools/render_control_subtracted_br_regions.py
+tools/render_individual_object_trace_figure.py
+tools/render_selected_tracking_frames.py
+tools/render_trace_distribution_plot.py
+tools/render_track_overlay.py

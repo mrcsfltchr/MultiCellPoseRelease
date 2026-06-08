@@ -635,6 +635,26 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max-val-records", type=int, default=0, help="Optional cap on validation records loaded into memory.")
     parser.add_argument("--nimg-per-epoch", type=int, default=0, help="Images sampled per epoch. Defaults to number of unique loaded training records.")
     parser.add_argument(
+        "--early-stop",
+        action="store_true",
+        help=(
+            "Stop training when validation loss does not improve. Validation is "
+            "evaluated by the underlying Cellpose loop at epoch 0, epoch 5, then every 10 epochs."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help="Number of validation checks without improvement before early stopping.",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation-loss decrease required to count as an improvement.",
+    )
+    parser.add_argument(
         "--channel-sampling-mode",
         default="single-and-all",
         choices=("single-and-all", "none"),
@@ -782,7 +802,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         n_epochs=args.epochs,
-        early_stop=False,
+        early_stop=args.early_stop,
+        patience=args.early_stop_patience,
+        min_delta=args.early_stop_min_delta,
         model_name=model_name,
         seg_loss_weight=args.seg_loss_weight,
     )
@@ -804,6 +826,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "channel_sampling_mode": args.channel_sampling_mode,
                 "max_all_channel_combos": args.max_all_channel_combos,
                 "channel_sampling_val": args.channel_sampling_val,
+                "early_stop": args.early_stop,
+                "early_stop_patience": args.early_stop_patience,
+                "early_stop_min_delta": args.early_stop_min_delta,
                 "invalid_train_records": train_invalid,
                 "invalid_val_records": val_invalid,
             },

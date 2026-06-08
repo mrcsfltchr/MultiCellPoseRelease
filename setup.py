@@ -26,7 +26,12 @@ install_deps = [
 image_deps = ['nd2', 'pynrrd', 'readlif']
 
 gui_deps = [
-    'pyqtgraph>=0.12.4', "pyqt6", "pyqt6.sip", 'qtpy', 'superqt',
+    'pyqtgraph>=0.12.4',
+    "PyQt6>=6.7,<6.10",
+    "PyQt6-Qt6>=6.7,<6.10",
+    "PyQt6-sip>=13.8,<14",
+    'qtpy',
+    'superqt',
     'nd2', 'pynrrd', 'readlif',
 ]
 
@@ -64,23 +69,26 @@ except:
     pass
 
 try:
-    import PyQt6
-    gui_deps.remove("pyqt6")
-    gui_deps.remove("pyqt6.sip")
+    from PyQt6 import QtCore  # noqa: F401
+    gui_deps.remove("PyQt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-Qt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-sip>=13.8,<14")
 except:
     pass
 
 try:
     import PySide2
-    gui_deps.remove("pyqt6")
-    gui_deps.remove("pyqt6.sip")
+    gui_deps.remove("PyQt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-Qt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-sip>=13.8,<14")
 except:
     pass
 
 try:
     import PySide6
-    gui_deps.remove("pyqt6")
-    gui_deps.remove("pyqt6.sip")
+    gui_deps.remove("PyQt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-Qt6>=6.7,<6.10")
+    gui_deps.remove("PyQt6-sip>=13.8,<14")
 except:
     pass
 
@@ -111,6 +119,7 @@ setup(
         "local_scheme": "no-local-version",
     },
     py_modules=["train_headless", "run_server"],
+    python_requires=">=3.10,<3.13",
     install_requires=install_deps, tests_require=['pytest'], extras_require={
         'docs': docs_deps,
         'gui': gui_deps,
@@ -119,6 +128,9 @@ setup(
         'all': gui_deps + distributed_deps + image_deps + bioimageio_deps,
     }, include_package_data=True, classifiers=[
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Operating System :: OS Independent",
     ], entry_points={'console_scripts': [
         'multicellpose-gui = guv_app.main:main',

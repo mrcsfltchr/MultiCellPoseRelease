@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N cpsam_foundation
+#PBS -l select=1:ncpus=16:ngpus=4:mem=48gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+REPO_DIR="$HOME/MultiCellPose"
+TRAIN_DIR="$HOME/FoundationTrain/train"
+OUTPUT_DIR="$HOME/FoundationTrain/models"
+SAM_CHECKPOINT_SRC="$HOME/.cellpose/models/sam_vit_l_0b3195.pth"
+
+cd "$REPO_DIR"
+
+if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+elif [ -x "$HOME/miniforge3/bin/conda" ]; then
+    eval "$($HOME/miniforge3/bin/conda shell.bash hook)"
+else
+    echo "ERROR: conda not found in $HOME/miniconda3 or $HOME/miniforge3"
+    exit 2
+fi
+conda activate cpsam_foundation310
+
+mkdir -p "$TMPDIR/models"
+mkdir -p "$OUTPUT_DIR"
+cp "$SAM_CHECKPOINT_SRC" "$TMPDIR/models/sam_vit_l_0b3195.pth"
+
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
+echo "TRAIN_DIR=$TRAIN_DIR"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+
+python "$REPO_DIR/scripts/train_cpsam_foundation_multigpu.py" \
+  --train-dir "$TRAIN_DIR" \
+  --save-path "$OUTPUT_DIR" \
+  --foundation-training \
+  --sam-checkpoint "$TMPDIR/models/sam_vit_l_0b3195.pth" \
+  --multi-gpu dataparallel \
+  --batch-size 96 \
+  --epochs 500 \
+  --unfreeze-blocks 9 \
+  --learning-rate 5e-5 \
+  --bsize 256 \
+  --test-ratio 0.1 \
+  --flow-cache-dir "$EPHEMERAL/foundation_flow_cache"
