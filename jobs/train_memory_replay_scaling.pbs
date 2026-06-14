@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N cpsam_block_sweep
+#PBS -N cpsam_replay_sweep
 #PBS -l select=1:ncpus=16:ngpus=1:mem=192gb
 #PBS -l walltime=120:00:00
 #PBS -koed
@@ -7,28 +7,28 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
-ROOT_DIRS="${ROOT_DIRS:-$HOME/FoundationTrain $HOME/cpsamOODtest}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/FoundationTrain/cpsam_finetune_block_sweep}"
-SPLIT_MANIFEST="${SPLIT_MANIFEST:-$OUTPUT_ROOT/shared_full_dataset_splits.json}"
+FOUNDATION_ROOT="${FOUNDATION_ROOT:-$HOME/FoundationTrain}"
+OOD_ROOT="${OOD_ROOT:-$HOME/cpsamOODtest}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/memory_replay_scaling}"
+SHARED_SPLIT_MANIFEST="${SHARED_SPLIT_MANIFEST:-$HOME/FoundationTrain/cpsam_finetune_block_sweep/shared_full_dataset_splits.json}"
 CONDA_ENV="${CONDA_ENV:-mcp_pub}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 
-BLOCKS="${BLOCKS:-9 12 15 18 full}"
-FULL_BLOCKS_VALUE="${FULL_BLOCKS_VALUE:-999}"
+REPLAY_COUNTS="${REPLAY_COUNTS:-0 250 500 1000 2000 4000 8000}"
+OOD_TRAIN_RECORDS="${OOD_TRAIN_RECORDS:-0}"
 BASE_MODEL="${BASE_MODEL:-cpsam}"
-MODEL_PREFIX="${MODEL_PREFIX:-guvpose_full}"
+MODEL_PREFIX="${MODEL_PREFIX:-guvpose_replay}"
 EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-BATCH_SIZE_BY_BLOCK="${BATCH_SIZE_BY_BLOCK:-9:8,12:6,15:4,18:2,full:1}"
 B_SIZE="${B_SIZE:-256}"
-MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
 MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-300}"
 NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
 NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
-NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/cpsam_finetune_block_sweep_npz_cache}"
+NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/cpsam_memory_replay_npz_cache}"
 CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
 MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
 CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-false}"
+UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-9}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SCALE_RANGE="${SCALE_RANGE:-0.5}"
@@ -81,20 +81,19 @@ echo "Node: $(hostname)"
 echo "Start: $(date)"
 python -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
 echo "REPO_DIR=$REPO_DIR"
-echo "ROOT_DIRS=$ROOT_DIRS"
+echo "FOUNDATION_ROOT=$FOUNDATION_ROOT"
+echo "OOD_ROOT=$OOD_ROOT"
 echo "OUTPUT_ROOT=$OUTPUT_ROOT"
-echo "SPLIT_MANIFEST=$SPLIT_MANIFEST"
+echo "SHARED_SPLIT_MANIFEST=$SHARED_SPLIT_MANIFEST"
 echo "CONDA_ENV=$CONDA_ENV"
 echo "CUDA_MODULE=$CUDA_MODULE"
-echo "BLOCKS=$BLOCKS"
-echo "FULL_BLOCKS_VALUE=$FULL_BLOCKS_VALUE"
+echo "REPLAY_COUNTS=$REPLAY_COUNTS"
+echo "OOD_TRAIN_RECORDS=$OOD_TRAIN_RECORDS"
 echo "BASE_MODEL=$BASE_MODEL"
 echo "MODEL_PREFIX=$MODEL_PREFIX"
 echo "EPOCHS=$EPOCHS"
 echo "BATCH_SIZE=$BATCH_SIZE"
-echo "BATCH_SIZE_BY_BLOCK=$BATCH_SIZE_BY_BLOCK"
 echo "B_SIZE=$B_SIZE"
-echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
 echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
 echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
 echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
@@ -102,31 +101,32 @@ echo "NPZ_CACHE_DIR=$NPZ_CACHE_DIR"
 echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
 echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
 echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
+echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
 echo "LEARNING_RATE=$LEARNING_RATE"
 echo "EARLY_STOP=$EARLY_STOP"
 echo "EARLY_STOP_PATIENCE=$EARLY_STOP_PATIENCE"
 echo "EARLY_STOP_MIN_DELTA=$EARLY_STOP_MIN_DELTA"
 
-python "$REPO_DIR/tools/run_encoder_block_finetune_sweep.py" \
-    --root-dirs $ROOT_DIRS \
+python "$REPO_DIR/tools/run_memory_replay_scaling_experiment.py" \
+    --foundation-root "$FOUNDATION_ROOT" \
+    --ood-root "$OOD_ROOT" \
     --output-root "$OUTPUT_ROOT" \
-    --split-manifest "$SPLIT_MANIFEST" \
-    --blocks $BLOCKS \
-    --full-blocks-value "$FULL_BLOCKS_VALUE" \
+    --shared-split-manifest "$SHARED_SPLIT_MANIFEST" \
+    --replay-counts $REPLAY_COUNTS \
+    --ood-train-records "$OOD_TRAIN_RECORDS" \
     --base-model "$BASE_MODEL" \
     --model-prefix "$MODEL_PREFIX" \
     --epochs "$EPOCHS" \
     --batch-size "$BATCH_SIZE" \
-    --batch-size-by-block "$BATCH_SIZE_BY_BLOCK" \
     --bsize "$B_SIZE" \
     --learning-rate "$LEARNING_RATE" \
     --weight-decay "$WEIGHT_DECAY" \
     --scale-range "$SCALE_RANGE" \
     --seg-loss-weight "$SEG_LOSS_WEIGHT" \
+    --unfreeze-blocks "$UNFREEZE_BLOCKS" \
     --val-ratio "$VAL_RATIO" \
     --test-ratio "$TEST_RATIO" \
     --seed "$SEED" \
-    --max-train-records "$MAX_TRAIN_RECORDS" \
     --max-val-records "$MAX_VAL_RECORDS" \
     --nimg-per-epoch "$NIMG_PER_EPOCH" \
     --balance-mode source \
