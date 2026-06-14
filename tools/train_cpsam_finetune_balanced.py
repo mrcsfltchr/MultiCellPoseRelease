@@ -683,12 +683,74 @@ def parse_args(argv: Sequence[str] | None = None):
         help="Directory for extracted .npz member .npy files. Required to train from large .npz archives efficiently.",
     )
     parser.add_argument("--use-validation-as-test", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--print-frozen-layers",
+        action="store_true",
+        help="After applying --unfreeze-blocks, print parameters whose requires_grad flag is False.",
+    )
+    parser.add_argument(
+        "--print-trainable-layers",
+        action="store_true",
+        help="After applying --unfreeze-blocks, print parameters whose requires_grad flag is True.",
+    )
+    parser.add_argument(
+        "--trainability-report-only",
+        action="store_true",
+        help="Build the model, apply --unfreeze-blocks, print the trainability report, then exit before loading data.",
+    )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if not args.root_dirs and not args.data_dirs:
+    if not args.root_dirs and not args.data_dirs and not args.trainability_report_only:
         parser.error("Provide --root-dirs and/or --data-dirs")
     return args
+
+
+def print_trainability_report(net, *, print_frozen: bool = False, print_trainable: bool = False) -> None:
+    total_params = 0
+    trainable_params = 0
+    frozen_params = 0
+    frozen_names = []
+    trainable_names = []
+
+    for name, param in net.named_parameters():
+        n_params = int(param.numel())
+        total_params += n_params
+        if param.requires_grad:
+            trainable_params += n_params
+            trainable_names.append((name, n_params))
+        else:
+            frozen_params += n_params
+            frozen_names.append((name, n_params))
+
+    print(
+        "trainability summary: "
+        f"total_params={total_params:,} trainable={trainable_params:,} frozen={frozen_params:,}"
+    )
+
+    if hasattr(net, "encoder") and hasattr(net.encoder, "blocks"):
+        print("encoder block trainability:")
+        for index, block in enumerate(net.encoder.blocks):
+            block_params = list(block.named_parameters())
+            n_total = sum(int(param.numel()) for _, param in block_params)
+            n_trainable = sum(int(param.numel()) for _, param in block_params if param.requires_grad)
+            if n_trainable == 0:
+                state = "frozen"
+            elif n_trainable == n_total:
+                state = "trainable"
+            else:
+                state = "mixed"
+            print(f"  encoder.blocks.{index:02d}: {state} ({n_trainable:,}/{n_total:,} params trainable)")
+
+    if print_frozen:
+        print("parameters with requires_grad=False:")
+        for name, n_params in frozen_names:
+            print(f"  frozen {name} ({n_params:,} params)")
+
+    if print_trainable:
+        print("parameters with requires_grad=True:")
+        for name, n_params in trainable_names:
+            print(f"  trainable {name} ({n_params:,} params)")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -700,6 +762,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     split_manifest_path = Path(args.split_manifest) if args.split_manifest else output_dir / "cpsam_finetune_splits.json"
+
+    if args.trainability_report_only:
+        device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+        net = build_net(args.base_model, device)
+        trainability_info = configure_trainable_params(
+            net,
+            use_lora=False,
+            lora_blocks=None,
+            unfreeze_blocks=args.unfreeze_blocks,
+            logger=None,
+        )
+        print(
+            "applied trainability policy: "
+            f"encoder_blocks={trainability_info.get('total_encoder_blocks', 0)} "
+            f"unfrozen_encoder_blocks={trainability_info.get('applied_unfreeze_blocks', 0)}"
+        )
+        print_trainability_report(
+            net,
+            print_frozen=True if not args.print_trainable_layers else args.print_frozen_layers,
+            print_trainable=args.print_trainable_layers,
+        )
+        return 0
 
     if split_manifest_path.exists() and not args.redo_splits:
         manifest = load_split_manifest(split_manifest_path)
@@ -768,13 +852,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"training model={model_name} on device={device}")
     print(f"unfreezing last {args.unfreeze_blocks} encoder blocks plus CPSAM heads")
-    configure_trainable_params(
+    trainability_info = configure_trainable_params(
         net,
         use_lora=False,
         lora_blocks=None,
         unfreeze_blocks=args.unfreeze_blocks,
         logger=None,
     )
+    print(
+        "applied trainability policy: "
+        f"encoder_blocks={trainability_info.get('total_encoder_blocks', 0)} "
+        f"unfrozen_encoder_blocks={trainability_info.get('applied_unfreeze_blocks', 0)}"
+    )
+    if args.print_frozen_layers or args.print_trainable_layers:
+        print_trainability_report(
+            net,
+            print_frozen=args.print_frozen_layers,
+            print_trainable=args.print_trainable_layers,
+        )
     if not hasattr(net, "diam_mean") or net.diam_mean is None or not torch.is_tensor(net.diam_mean):
         net.diam_mean = torch.nn.Parameter(torch.tensor([30.0], device=device), requires_grad=False)
     if not hasattr(net, "diam_labels") or net.diam_labels is None or not torch.is_tensor(net.diam_labels):
