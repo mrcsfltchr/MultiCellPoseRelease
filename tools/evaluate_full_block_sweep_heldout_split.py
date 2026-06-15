@@ -87,6 +87,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--blocks", nargs="*", default=list(DEFAULT_BLOCKS))
     parser.add_argument("--model-dir", default=str(Path.home() / ".cellpose" / "models"))
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--fallback-output-dir",
+        default="heldout_split_standardized_evaluation",
+        help=(
+            "Local fallback directory used if --output-dir/default sweep output "
+            "cannot be created or becomes unavailable during final writes."
+        ),
+    )
+    parser.add_argument(
+        "--no-fallback-output-dir",
+        action="store_true",
+        help="Fail instead of using --fallback-output-dir when the requested output path is unavailable.",
+    )
     parser.add_argument("--results-prefix", default=None)
     parser.add_argument(
         "--path-map",
@@ -96,11 +109,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--npz-mask-channel", default="last")
     parser.add_argument("--npz-cache-dir", default=None)
+    parser.add_argument(
+        "--source-contains",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional case-insensitive substrings used to keep only held-out records "
+            "whose source_group, image path, or label path contains one of the values. "
+            "Example: --source-contains cpsamOODtest"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-source-contains",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional case-insensitive substrings used to drop held-out records whose "
+            "source_group, image path, or label path contains one of the values."
+        ),
+    )
     parser.add_argument("--iou-thresholds", nargs="+", type=float, default=[0.5, 0.75, 0.9])
     parser.add_argument("--class2-iou-threshold", type=float, default=0.5)
     parser.add_argument("--target-class", type=int, default=1)
     parser.add_argument("--misdetect-class", type=int, default=2)
-    parser.add_argument("--ignore-classes", action="store_true")
+    parser.add_argument(
+        "--ignore-classes",
+        "--class-agnostic",
+        dest="ignore_classes",
+        action="store_true",
+        help=(
+            "Class-agnostic evaluation: treat every ground-truth instance as a target object, "
+            "ignore class maps/classes, and do not force predictions overlapping class 2 to false positives."
+        ),
+    )
+    parser.add_argument(
+        "--respect-classes",
+        dest="ignore_classes",
+        action="store_false",
+        help="Class-aware evaluation: target --target-class and count --misdetect-class overlaps as false detections.",
+    )
+    parser.set_defaults(ignore_classes=False)
     parser.add_argument("--diameter", type=float, default=0.0)
     parser.add_argument("--tile", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -197,6 +245,35 @@ def load_records(args: argparse.Namespace) -> list[HeldoutRecord]:
             )
         )
     return out
+
+
+def record_search_text(record: HeldoutRecord) -> str:
+    return "\n".join(
+        [
+            record.source_group,
+            str(record.image_path),
+            str(record.label_path),
+            record.original_image,
+            record.original_label,
+        ]
+    ).lower()
+
+
+def filter_records_by_source(records: list[HeldoutRecord], args: argparse.Namespace) -> list[HeldoutRecord]:
+    include_terms = [term.lower() for term in (args.source_contains or []) if term]
+    exclude_terms = [term.lower() for term in (args.exclude_source_contains or []) if term]
+    if not include_terms and not exclude_terms:
+        return records
+
+    filtered: list[HeldoutRecord] = []
+    for record in records:
+        text = record_search_text(record)
+        if include_terms and not any(term in text for term in include_terms):
+            continue
+        if exclude_terms and any(term in text for term in exclude_terms):
+            continue
+        filtered.append(record)
+    return filtered
 
 
 def rel_path_or_original(path: Path, root: Path, original: str) -> str:
@@ -301,15 +378,75 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def assert_writable_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".write_probe"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+    return path
+
+
+def choose_output_dir(args: argparse.Namespace, sweep_root: Path) -> Path:
+    requested = Path(args.output_dir) if args.output_dir else sweep_root / "heldout_split_standardized_evaluation"
+    try:
+        return assert_writable_dir(requested)
+    except OSError as exc:
+        if args.no_fallback_output_dir:
+            raise
+        fallback = assert_writable_dir(Path(args.fallback_output_dir))
+        print(f"warning: output directory unavailable: {requested}")
+        print(f"warning: {exc}")
+        print(f"writing outputs to fallback directory: {fallback.resolve()}")
+        return fallback
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
+def write_csv_with_fallback(path: Path, rows: list[dict], fallback_dir: Path | None) -> Path:
+    try:
+        write_csv(path, rows)
+        return path
+    except OSError as exc:
+        if fallback_dir is None or same_path(path.parent, fallback_dir):
+            raise
+        fallback_path = fallback_dir / path.name
+        print(f"warning: failed to write {path}: {exc}")
+        print(f"writing {path.name} to fallback directory: {fallback_dir.resolve()}")
+        write_csv(fallback_path, rows)
+        return fallback_path
+
+
+def write_json_with_fallback(path: Path, payload: dict, fallback_dir: Path | None) -> Path:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+    except OSError as exc:
+        if fallback_dir is None or same_path(path.parent, fallback_dir):
+            raise
+        fallback_path = fallback_dir / path.name
+        print(f"warning: failed to write {path}: {exc}")
+        print(f"writing {path.name} to fallback directory: {fallback_dir.resolve()}")
+        fallback_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return fallback_path
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     sweep_root = Path(args.sweep_root)
-    output_dir = Path(args.output_dir) if args.output_dir else sweep_root / "heldout_split_standardized_evaluation"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = choose_output_dir(args, sweep_root)
+    fallback_output_dir = None if args.no_fallback_output_dir else assert_writable_dir(Path(args.fallback_output_dir))
+    print(f"output directory: {output_dir.resolve()}")
     prefix = args.results_prefix or time.strftime("heldout_split_eval_%Y%m%d_%H%M%S")
     model_dir = Path(args.model_dir).expanduser().resolve()
 
     records = load_records(args)
+    before_source_filter = len(records)
+    records = filter_records_by_source(records, args)
+    if len(records) != before_source_filter:
+        print(f"source filter kept {len(records)}/{before_source_filter} held-out {args.split} records")
     if not records:
         raise ValueError(f"No records found for split={args.split!r}")
     print(f"loaded {len(records)} held-out {args.split} records")
@@ -370,8 +507,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     per_image_csv = output_dir / f"{prefix}_per_image.csv"
     summary_csv = output_dir / f"{prefix}_summary.csv"
     summary_json = output_dir / f"{prefix}_summary.json"
-    write_csv(per_image_csv, all_rows)
-    write_csv(summary_csv, summaries)
+    per_image_csv = write_csv_with_fallback(per_image_csv, all_rows, fallback_output_dir)
+    summary_csv = write_csv_with_fallback(summary_csv, summaries, fallback_output_dir)
     payload = {
         "sweep_root": str(sweep_root),
         "split_manifest": str(Path(args.split_manifest) if args.split_manifest else sweep_root / "shared_full_dataset_splits.json"),
@@ -387,7 +524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "summaries": summaries,
         "failures": failures,
     }
-    summary_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    summary_json = write_json_with_fallback(summary_json, payload, fallback_output_dir)
     print(f"wrote per-image metrics: {per_image_csv}")
     print(f"wrote summary CSV: {summary_csv}")
     print(f"wrote summary JSON: {summary_json}")

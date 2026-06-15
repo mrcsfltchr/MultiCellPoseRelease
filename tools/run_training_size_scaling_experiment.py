@@ -109,7 +109,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--eval-max-records", type=int, default=0)
-    parser.add_argument("--ignore-classes", action="store_true")
+    parser.add_argument(
+        "--ignore-classes",
+        "--class-agnostic",
+        dest="ignore_classes",
+        action="store_true",
+        help="Forward class-agnostic evaluation to evaluate_standardized_test_models.py.",
+    )
+    parser.add_argument(
+        "--respect-classes",
+        dest="ignore_classes",
+        action="store_false",
+        help="Forward class-aware evaluation to evaluate_standardized_test_models.py.",
+    )
+    parser.set_defaults(ignore_classes=False)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--skip-training", action="store_true")
     parser.add_argument("--skip-evaluation", action="store_true")
