@@ -81,12 +81,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--misdetect-class", type=int, default=2)
     parser.add_argument(
         "--ignore-classes",
+        "--class-agnostic",
+        dest="ignore_classes",
         action="store_true",
         help=(
             "Class-agnostic evaluation: treat every ground-truth instance as a target object, "
             "ignore class maps/classes, and do not force predictions overlapping class 2 to false positives."
         ),
     )
+    parser.add_argument(
+        "--respect-classes",
+        dest="ignore_classes",
+        action="store_false",
+        help="Class-aware evaluation: target --target-class and count --misdetect-class overlaps as false detections.",
+    )
+    parser.set_defaults(ignore_classes=False)
     parser.add_argument("--diameter", type=float, default=0.0, help="Diameter hint; 0 means model default/auto.")
     parser.add_argument("--tile", action="store_true")
     parser.add_argument("--batch-size", type=int, default=8)

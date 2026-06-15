@@ -38,7 +38,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bsize", type=int, default=256)
     parser.add_argument("--max-records", type=int, default=0)
-    parser.add_argument("--ignore-classes", action="store_true")
+    parser.add_argument(
+        "--ignore-classes",
+        "--class-agnostic",
+        dest="ignore_classes",
+        action="store_true",
+        help="Forward class-agnostic evaluation to evaluate_standardized_test_models.py.",
+    )
+    parser.add_argument(
+        "--respect-classes",
+        dest="ignore_classes",
+        action="store_false",
+        help="Forward class-aware evaluation to evaluate_standardized_test_models.py.",
+    )
+    parser.set_defaults(ignore_classes=False)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
