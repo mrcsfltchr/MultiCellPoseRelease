@@ -1399,6 +1399,8 @@ class InferenceService(pb2_grpc.InferenceServiceServicer):
         bsize = int(training_params.get("bsize", 256))
         rescale = bool(training_params.get("rescale", False))
         scale_range = float(training_params.get("scale_range", 0.5))
+        seg_loss_weight = float(training_params.get("seg_loss_weight", 1.0))
+        class_loss_weight = float(training_params.get("class_loss_weight", 1.0))
         out = train.train_seg(
             model.net, train_data=train_data, train_labels=train_labels,
             test_data=test_data, test_labels=test_labels, test_files=test_files,
@@ -1412,7 +1414,8 @@ class InferenceService(pb2_grpc.InferenceServiceServicer):
             scale_range=scale_range,
             learning_rate=learning_rate, weight_decay=weight_decay,
             n_epochs=n_epochs, early_stop=early_stop,
-            model_name=model_name, class_weights=class_weights)
+            model_name=model_name, class_weights=class_weights,
+            seg_loss_weight=seg_loss_weight, class_loss_weight=class_loss_weight)
         if isinstance(out, (list, tuple)):
             model_path = out[0]
             train_losses = out[1] if len(out) > 1 else None
