@@ -28,6 +28,15 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     parser.add_argument("--root-dirs", nargs="+", default=[r"X:\home\FoundationTrain", r"X:\home\cpsamOODtest"])
     parser.add_argument("--output-root", default=r"X:\home\FoundationTrain\cpsam_finetune_block_sweep")
     parser.add_argument("--split-manifest", default=None)
+    parser.add_argument(
+        "--path-map",
+        nargs="*",
+        default=[r"/rds/general/user/mfletch1/home=X:\home"],
+        help=(
+            "Optional path prefix maps passed to train_cpsam_finetune_balanced.py "
+            "for reusing manifests created on another filesystem."
+        ),
+    )
     parser.add_argument("--blocks", nargs="+", default=["9", "12", "15", "18", "full"])
     parser.add_argument(
         "--full-blocks-value",
@@ -170,6 +179,8 @@ def build_command(
         "--npz-mask-channel",
         str(args.npz_mask_channel),
     ]
+    if args.path_map:
+        cmd.extend(["--path-map", *[str(item) for item in args.path_map]])
     cmd.append("--channel-sampling-val" if args.channel_sampling_val else "--no-channel-sampling-val")
     if args.npz_cache_dir:
         cmd.extend(["--npz-cache-dir", str(Path(args.npz_cache_dir) / f"blocks{block_label}")])
