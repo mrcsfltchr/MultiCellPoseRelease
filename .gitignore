@@ -40,6 +40,7 @@ ENV/
 .cellpose_server_data/
 remote_config.json
 models/
+paper/
 *.log
 *.tmp
 
