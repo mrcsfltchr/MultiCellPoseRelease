@@ -121,6 +121,13 @@ class TrainingConfigDialog(QDialog):
         self.seg_loss_weight_spin.setValue(float(default_config.seg_loss_weight))
         advanced_form.addRow("Segmentation loss weight:", self.seg_loss_weight_spin)
 
+        self.class_loss_weight_spin = QDoubleSpinBox()
+        self.class_loss_weight_spin.setDecimals(3)
+        self.class_loss_weight_spin.setRange(0.0, 100.0)
+        self.class_loss_weight_spin.setSingleStep(0.5)
+        self.class_loss_weight_spin.setValue(float(default_config.class_loss_weight))
+        advanced_form.addRow("Class loss weight:", self.class_loss_weight_spin)
+
         self.min_masks_spin = QSpinBox()
         self.min_masks_spin.setRange(0, 100000)
         self.min_masks_spin.setValue(default_config.min_train_masks)
@@ -252,6 +259,7 @@ class TrainingConfigDialog(QDialog):
             rescale=bool(self.rescale_checkbox.isChecked()),
             scale_range=float(self.scale_range_spin.value()),
             seg_loss_weight=float(self.seg_loss_weight_spin.value()),
+            class_loss_weight=float(self.class_loss_weight_spin.value()),
             min_train_masks=int(self.min_masks_spin.value()),
             use_lora=bool(self.use_lora_checkbox.isChecked()),
             lora_blocks=int(self.lora_blocks_spin.value()),

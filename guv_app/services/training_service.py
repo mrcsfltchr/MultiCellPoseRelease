@@ -125,9 +125,31 @@ def _insert_class_map(flow_labels, class_maps):
     return updated
 
 
+def _resolve_training_device(device=None):
+    """Resolve the compute device, preferring CUDA, then Apple MPS, then CPU.
+
+    Accepts a preselected ``torch.device``/string and returns it unchanged;
+    otherwise auto-detects. MPS is only chosen when no CUDA device is present,
+    so CUDA is always preferred when both are available.
+    """
+    if device is not None:
+        return device if isinstance(device, torch.device) else torch.device(device)
+    try:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+    except Exception:
+        pass
+    try:
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+    except Exception:
+        pass
+    return torch.device("cpu")
+
+
 def _initialize_class_net(nclasses=2, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_training_device(device)
     cfg = remote_config.load_remote_config()
     cpsam_path = (
         cfg.get("cpsam_model_path")
@@ -145,9 +167,17 @@ def _initialize_class_net(nclasses=2, device=None):
     i = 0
     net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = -0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
     net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = b0[(nout - 1) * ps**2 : nout * ps**2]
+    # Break the symmetry between foreground class channels (mirrors
+    # CellposeModel.__init__): identical channels get identical gradients and
+    # never specialise, collapsing every object onto a single class.
+    base_w = 0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
+    base_b = b0[(nout - 1) * ps**2 : nout * ps**2]
+    perturb_scale = 1e-2 * float(base_w.abs().mean()) if base_w.numel() else 1e-3
+    gen = torch.Generator().manual_seed(0)
     for i in range(1, nclasses):
-        net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = 0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
-        net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = b0[(nout - 1) * ps**2 : nout * ps**2]
+        noise = (perturb_scale * torch.randn(base_w.shape, generator=gen)).to(device)
+        net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = base_w + noise
+        net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = base_b
     net.out.weight.data[-(nout * ps**2) :] = w0
     net.out.bias.data[-(nout * ps**2) :] = b0
     net.W2 = nn.Parameter(
@@ -567,6 +597,8 @@ class TrainingService:
             early_stop=False,
             model_name=config.model_name,
             class_weights=class_weights,
+            seg_loss_weight=config.seg_loss_weight,
+            class_loss_weight=config.class_loss_weight,
             progress_callback=progress_callback,
         )
 

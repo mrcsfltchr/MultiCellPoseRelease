@@ -38,10 +38,22 @@ def extract_class_maps_from_labels(labels):
     return class_maps
 
 
-def compute_class_weights_from_class_maps(class_maps, nclasses=None):
+def compute_class_weights_from_class_maps(class_maps, nclasses=None,
+                                          include_background=True, normalize=True):
     """
     Compute inverse-frequency class weights from class maps.
-    Returns weight vector including background index 0.
+
+    Returns a weight vector including background at index 0.
+
+    When ``include_background`` is True (default) the background class (id 0)
+    is part of the inverse-frequency calculation, so its typically large pixel
+    count gives it a correspondingly small weight and it no longer dominates
+    the mean cross-entropy. This is what lets the class head receive real
+    gradient to separate the foreground classes. Set ``include_background`` to
+    False to restore the legacy behaviour where background weight is fixed at
+    1.0. When ``normalize`` is True the weights are rescaled so their mean is
+    ~1, keeping the overall class-loss magnitude stable regardless of the
+    number of classes.
     """
     if not class_maps:
         return None
@@ -51,7 +63,7 @@ def compute_class_weights_from_class_maps(class_maps, nclasses=None):
             if cmap is None:
                 continue
             cmap = np.squeeze(cmap)
-            if cmap.ndim != 2:
+            if getattr(cmap, "ndim", 0) != 2:
                 continue
             cmap = np.rint(cmap).astype(np.int64, copy=False)
             if not np.any(cmap > 0):
@@ -64,28 +76,34 @@ def compute_class_weights_from_class_maps(class_maps, nclasses=None):
         if global_max < 1:
             return None
 
-        pimg = []
+        n_present = global_max + 1
+        # Accumulate global pixel counts per class (index 0 == background) so
+        # frequencies reflect the whole dataset, not a per-image average.
+        counts = np.zeros(n_present, dtype=np.float64)
         for cmap in cleaned:
-            counts = np.bincount(cmap.ravel(), minlength=global_max + 1).astype(np.float32)
-            counts = counts[1:global_max + 1]
-            if counts.size == 0:
-                continue
-            total = counts.sum() if counts.sum() > 0 else 1.0
-            pimg.append(counts / total)
-        if not pimg:
-            return None
+            counts += np.bincount(cmap.ravel(), minlength=n_present)[:n_present]
 
-        pclass = np.mean(np.stack(pimg, axis=0), axis=0)
-        pclass[pclass == 0] = 1.0
-        inv = 1.0 / pclass
+        total = counts.sum()
+        if total <= 0:
+            return None
+        freq = counts / total
+
+        # Inverse frequency; classes with no pixels get a neutral weight of 1.0.
+        inv = np.ones(n_present, dtype=np.float32)
+        nonzero = freq > 0
+        inv[nonzero] = (1.0 / freq[nonzero]).astype(np.float32)
+        if not include_background:
+            inv[0] = 1.0
 
         if nclasses is None:
-            nclasses = int(global_max + 1)
+            nclasses = n_present
         nclasses = int(max(1, nclasses))
         weights = np.ones(nclasses, dtype=np.float32)
-        fill_len = min(len(inv), max(0, nclasses - 1))
-        if fill_len > 0:
-            weights[1:1 + fill_len] = inv[:fill_len]
+        fill_len = min(n_present, nclasses)
+        weights[:fill_len] = inv[:fill_len]
+
+        if normalize and weights.sum() > 0:
+            weights *= float(nclasses) / float(weights.sum())
         return weights
     except Exception:
         return None

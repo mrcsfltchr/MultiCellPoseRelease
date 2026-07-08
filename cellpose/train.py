@@ -392,7 +392,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
-              min_train_masks=5, model_name=None, class_weights=None, seg_loss_weight = 0.1,
+              min_train_masks=5, model_name=None, class_weights=None,
+              seg_loss_weight=1.0, class_loss_weight=1.0,
               early_stop=False, patience=3, min_delta=0.0, progress_callback=None):
     """
     Train the network with images for segmentation.
@@ -648,12 +649,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             t_to = time.perf_counter() - t0_to
             t0_fwd = time.perf_counter()
             y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
+            loss = seg_loss_weight * _loss_fn_seg(lbl, y, device)
             loss3 = None
             if y.shape[1] > 3:
                 # train_logger.info(f">>> calculating class loss ...")
                 loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss = loss + loss3
+                loss = loss + class_loss_weight * loss3
             t_fwd = time.perf_counter() - t0_fwd
             t0_bwd = time.perf_counter()
             optimizer.zero_grad()
@@ -729,11 +730,11 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         t_to = time.perf_counter() - t0_to
                         t0_fwd = time.perf_counter()
                         y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
+                        loss = seg_loss_weight * _loss_fn_seg(lbl, y, device)
                         loss3 = None
                         if y.shape[1] > 3:
                             loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                            loss = loss + loss3            
+                            loss = loss + class_loss_weight * loss3
                         t_fwd = time.perf_counter() - t0_fwd
                         test_loss = loss.item()
                         test_class_loss = loss3.item() if loss3 is not None else 0.0

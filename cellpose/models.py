@@ -173,10 +173,19 @@ class CellposeModel():
                     i = 0
                     net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = -0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
                     net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = b0[(nout - 1) * ps**2 : nout * ps**2]
-                    # remaining classes init
+                    # remaining classes init: seed each foreground class channel from
+                    # the cellprob channel but add a small deterministic per-channel
+                    # perturbation so the channels are NOT identical. Identical channels
+                    # produce identical logits and therefore identical gradients, so they
+                    # can never specialise -- which collapses every object onto one class.
+                    base_w = 0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
+                    base_b = b0[(nout - 1) * ps**2 : nout * ps**2]
+                    perturb_scale = 1e-2 * float(base_w.abs().mean()) if base_w.numel() else 1e-3
+                    gen = torch.Generator().manual_seed(0)
                     for i in range(1, nclasses):
-                        net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = 0.5 * w0[(nout - 1) * ps**2 : nout * ps**2]
-                        net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = b0[(nout - 1) * ps**2 : nout * ps**2]
+                        noise = (perturb_scale * torch.randn(base_w.shape, generator=gen)).to(self.device)
+                        net.out.weight.data[i * ps**2 : (i + 1) * ps**2] = base_w + noise
+                        net.out.bias.data[i * ps**2 : (i + 1) * ps**2] = base_b
                     net.out.weight.data[-(nout * ps**2) :] = w0
                     net.out.bias.data[-(nout * ps**2) :] = b0
                     net.W2 = nn.Parameter(
