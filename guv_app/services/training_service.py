@@ -575,6 +575,16 @@ class TrainingService:
             test_data = None
             test_labels = None
             test_labels_for_training = None
+        train_nimg_per_epoch = (
+            int(config.nimg_per_epoch)
+            if config.nimg_per_epoch is not None
+            else len(train_data)
+        )
+        train_logger.info(
+            "GUI_INFO: training samples/crops per epoch: %s (source images=%s)",
+            train_nimg_per_epoch,
+            len(train_data),
+        )
         model_path, train_losses, test_losses = train.train_seg(
             self.net,
             train_data=train_data,
@@ -589,7 +599,7 @@ class TrainingService:
             rescale=config.rescale,
             scale_range=config.scale_range,
             save_path=str(save_dir),
-            nimg_per_epoch=len(train_data),
+            nimg_per_epoch=train_nimg_per_epoch,
             nimg_test_per_epoch=len(test_data) if test_data else 0,
             learning_rate=config.learning_rate,
             weight_decay=config.weight_decay,
