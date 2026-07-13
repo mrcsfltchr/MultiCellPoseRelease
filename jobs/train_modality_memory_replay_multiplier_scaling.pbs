@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N cpsam_mod_replay_mult
-#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l select=1:ncpus=12:ngpus=1:mem=32gb
 #PBS -l walltime=24:00:00
 #PBS -koed
 
