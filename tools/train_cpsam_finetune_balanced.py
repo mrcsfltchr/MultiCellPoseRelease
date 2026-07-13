@@ -417,6 +417,48 @@ def load_split_manifest(path: Path) -> SplitManifest:
     )
 
 
+def parse_path_maps(items: Sequence[str]) -> list[tuple[str, str]]:
+    maps: list[tuple[str, str]] = []
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Invalid --path-map {item!r}; expected FROM=TO")
+        src, dst = item.split("=", 1)
+        maps.append((src.replace("\\", "/").rstrip("/"), dst.rstrip("\\/")))
+    return maps
+
+
+def map_path(value: str | Path, path_maps: Sequence[tuple[str, str]]) -> Path:
+    raw = str(value)
+    path = Path(raw)
+    if path.exists():
+        return path
+    comparable = raw.replace("\\", "/")
+    for src, dst in path_maps:
+        if comparable.startswith(src):
+            suffix = comparable[len(src):].lstrip("/")
+            candidate = Path(dst) / Path(*suffix.split("/"))
+            if candidate.exists():
+                return candidate
+    return path
+
+
+def remap_manifest_records(records: Sequence[dict], path_maps: Sequence[tuple[str, str]]) -> tuple[list[dict], int]:
+    if not path_maps:
+        return [dict(row) for row in records], 0
+    remapped: list[dict] = []
+    n_changed = 0
+    for row in records:
+        updated = dict(row)
+        for key in ("image", "label"):
+            mapped = map_path(updated[key], path_maps)
+            mapped_text = str(mapped)
+            if mapped_text != str(updated[key]):
+                updated[key] = mapped_text
+                n_changed += 1
+        remapped.append(updated)
+    return remapped, n_changed
+
+
 def coerce_mask_2d(masks: np.ndarray, *, npz_mask_channel: str, label_path: Path, allow_channel_select: bool) -> np.ndarray:
     masks = np.squeeze(masks)
     if masks.ndim == 3 and not allow_channel_select and masks.shape[-1] in (3, 4):
@@ -617,6 +659,15 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--output-dir", default="cpsam_finetune_balanced")
     parser.add_argument("--split-manifest", default=None)
     parser.add_argument("--redo-splits", action="store_true")
+    parser.add_argument(
+        "--path-map",
+        nargs="*",
+        default=[r"/rds/general/user/mfletch1/home=X:\home"],
+        help=(
+            "Optional path prefix maps for existing split manifests, e.g. "
+            "/rds/general/user/name/home=X:\\home. Applied only when original paths are missing."
+        ),
+    )
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
@@ -802,6 +853,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_split_manifest(split_manifest_path, manifest)
         print(f"wrote split manifest: {split_manifest_path}")
         print(f"wrote split CSV: {split_manifest_path.with_suffix('.csv')}")
+
+    path_maps = parse_path_maps(args.path_map)
+    mapped_records, n_mapped_paths = remap_manifest_records(manifest.records, path_maps)
+    if n_mapped_paths:
+        print(f"remapped {n_mapped_paths} manifest paths using --path-map")
+        manifest = SplitManifest(
+            seed=manifest.seed,
+            val_ratio=manifest.val_ratio,
+            test_ratio=manifest.test_ratio,
+            records=mapped_records,
+        )
 
     summarize(manifest.records)
     train_records = records_for_split(manifest.records, "train")

@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N cpsam_replay_ood500_b03
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l walltime=72:00:00
+#PBS -koed
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+
+export UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-3}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/memory_replay_scaling_ood500_total2000_blocks03}"
+export MODEL_PREFIX="${MODEL_PREFIX:-guvpose_replay_ood500_blocks03}"
+export NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/cpsam_memory_replay_ood500_blocks03_npz_cache}"
+
+exec bash "$REPO_DIR/jobs/train_memory_replay_scaling_ood500_total2000.pbs"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import subprocess
 import sys
@@ -39,6 +40,16 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
         help="Optional existing split manifest covering FoundationTrain and cpsamOODtest. If provided, avoids rediscovery.",
     )
     parser.add_argument("--replay-counts", nargs="+", type=int, default=[0, 250, 500, 1000, 2000, 4000, 8000])
+    parser.add_argument(
+        "--replay-multipliers",
+        nargs="+",
+        type=float,
+        default=None,
+        help=(
+            "Optional FoundationTrain replay sizes expressed as multiples of the selected "
+            "cpsamOODtest train-set size. Overrides --replay-counts when provided."
+        ),
+    )
     parser.add_argument(
         "--ood-train-records",
         type=int,
@@ -83,7 +94,11 @@ def normalized_path_prefix(value: str | Path) -> str:
 def source_contains(row: dict, root_prefix: str, root_name: str) -> bool:
     image_text = str(row["image"]).replace("\\", "/").lower()
     group_text = str(row.get("source_group", "")).replace("\\", "/").lower()
-    marker = f"/{root_name.lower().strip('/')}"
+    root_parts = [part for part in root_prefix.lower().strip("/").split("/") if part]
+    marker_tail = root_parts[-1] if len(root_parts) < 2 else "/".join(root_parts[-2:])
+    if marker_tail.endswith(":"):
+        marker_tail = root_name.lower().strip("/")
+    marker = f"/{marker_tail}"
     return (
         image_text.startswith(root_prefix)
         or group_text.startswith(root_prefix)
@@ -171,6 +186,31 @@ def replay_label(count: int) -> str:
     return f"replay{int(count):05d}"
 
 
+def replay_counts_from_multipliers(
+    base_manifest: SplitManifest,
+    ood_root_prefix: str,
+    ood_root_name: str,
+    ood_train_records: int,
+    multipliers: Sequence[float],
+) -> tuple[list[int], dict[int, float], int, int]:
+    train = [row for row in base_manifest.records if row["split"] == "train"]
+    ood_train = [row for row in train if source_contains(row, ood_root_prefix, ood_root_name)]
+    basis_count = len(ood_train) if ood_train_records <= 0 else min(int(ood_train_records), len(ood_train))
+    if basis_count <= 0:
+        raise ValueError("Cannot derive replay counts from multipliers because no OOD train records were found.")
+
+    counts: list[int] = []
+    multiplier_by_count: dict[int, float] = {}
+    for multiplier in multipliers:
+        if multiplier < 0:
+            raise ValueError(f"Replay multipliers must be non-negative, got {multiplier}")
+        count = int(math.floor(basis_count * float(multiplier) + 0.5))
+        if count not in multiplier_by_count:
+            counts.append(count)
+            multiplier_by_count[count] = float(multiplier)
+    return counts, multiplier_by_count, basis_count, len(ood_train)
+
+
 def quote_cmd(cmd: Sequence[str]) -> str:
     return " ".join(f'"{part}"' if any(ch.isspace() for ch in str(part)) else str(part) for part in cmd)
 
@@ -208,8 +248,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote shared split manifest: {shared_manifest_path}")
         print(f"wrote shared split CSV: {shared_manifest_path.with_suffix('.csv')}")
 
+    replay_counts = [int(count) for count in args.replay_counts]
+    multiplier_by_count: dict[int, float] = {}
+    multiplier_basis_count = None
+    available_ood_train_records = None
+    if args.replay_multipliers:
+        replay_counts, multiplier_by_count, multiplier_basis_count, available_ood_train_records = replay_counts_from_multipliers(
+            base_manifest,
+            ood_root_prefix,
+            ood_root_name,
+            int(args.ood_train_records),
+            args.replay_multipliers,
+        )
+        print(
+            "derived replay counts from multipliers: "
+            f"basis_train_records={multiplier_basis_count} "
+            f"available_ood_train_records={available_ood_train_records} "
+            f"counts={replay_counts}"
+        )
+
     runs = []
-    for replay_count in args.replay_counts:
+    for replay_count in replay_counts:
         label = replay_label(replay_count)
         run_dir = output_root / label
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +290,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "foundation_root": str(foundation_root),
             "ood_root": str(ood_root),
             "split_manifest": str(split_manifest),
+            "replay_multiplier": multiplier_by_count.get(int(replay_count)),
+            "replay_multiplier_basis_train_records": multiplier_basis_count,
+            "available_ood_train_records_for_multiplier_basis": available_ood_train_records,
         }
         meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
 
