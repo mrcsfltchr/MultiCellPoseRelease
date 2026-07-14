@@ -238,11 +238,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"loaded existing shared split manifest: {shared_manifest_path}")
     else:
         labeled = discover_labeled_refs([str(foundation_root), str(ood_root)])
-        base_manifest = split_labeled_refs(
+        base_records = split_labeled_refs(
             labeled,
             seed=args.seed,
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
+        )
+        base_manifest = SplitManifest(
+            seed=args.seed,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            records=base_records,
         )
         write_split_manifest(shared_manifest_path, base_manifest)
         print(f"wrote shared split manifest: {shared_manifest_path}")
