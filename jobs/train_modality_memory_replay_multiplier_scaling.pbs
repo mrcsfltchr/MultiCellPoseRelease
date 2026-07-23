@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N cpsam_mod_replay_mult
 #PBS -l select=1:ncpus=12:ngpus=1:mem=32gb
-#PBS -l walltime=24:00:00
+#PBS -l walltime=36:00:00
 #PBS -koed
 
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
 FOUNDATION_ROOT="${FOUNDATION_ROOT:-$HOME/FoundationTrain}"
 OOD_ROOT="${OOD_ROOT:-$HOME/cpsamOODtest}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/modality_memory_replay_multiplier_scaling}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/modality_memory_replay_multiplier_scaling_fullencoder}"
 CONDA_ENV="${CONDA_ENV:-mcp_pub}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 
@@ -32,7 +32,7 @@ NPZ_CACHE_ROOT="${NPZ_CACHE_ROOT:-${TMPDIR:-$HOME/ephemeral}/cpsam_modality_repl
 CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
 MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
 CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-false}"
-UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-9}"
+UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-24}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SCALE_RANGE="${SCALE_RANGE:-0.5}"
