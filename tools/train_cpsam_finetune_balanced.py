@@ -647,8 +647,11 @@ def summarize(records: Sequence[dict]) -> None:
         print(f"  {split} | {group}: {count}")
 
 
-def build_net(base_model: str, device: torch.device):
-    model = CellposeModel(pretrained_model=base_model, gpu=device.type == "cuda")
+def build_net(base_model: str, device: torch.device, semantic_classes: int = 0):
+    model_kwargs = {}
+    if semantic_classes > 0:
+        model_kwargs["semantic_classes"] = semantic_classes
+    model = CellposeModel(pretrained_model=base_model, gpu=device.type == "cuda", **model_kwargs)
     return model.net.to(device)
 
 
@@ -680,6 +683,15 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--scale-range", type=float, default=0.5)
     parser.add_argument("--seg-loss-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--semantic-classes",
+        type=int,
+        default=0,
+        help=(
+            "Number of semantic classes including background. Use 4 for three "
+            "non-background classes, giving 7 output maps with CPSAM."
+        ),
+    )
     parser.add_argument("--unfreeze-blocks", type=int, default=9)
     parser.add_argument("--balance-mode", default="source", choices=("source", "none"))
     parser.add_argument("--max-train-records", type=int, default=0, help="Optional cap on unique training records loaded into memory.")
@@ -752,6 +764,8 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.semantic_classes < 0:
+        parser.error("--semantic-classes must be >= 0")
     if not args.root_dirs and not args.data_dirs and not args.trainability_report_only:
         parser.error("Provide --root-dirs and/or --data-dirs")
     return args
@@ -816,7 +830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.trainability_report_only:
         device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-        net = build_net(args.base_model, device)
+        net = build_net(args.base_model, device, args.semantic_classes)
         trainability_info = configure_trainable_params(
             net,
             use_lora=False,
@@ -909,10 +923,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"Internal loader error: train probabilities/data length mismatch ({len(train_probs)} != {len(train_data)})")
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    net = build_net(args.base_model, device)
+    net = build_net(args.base_model, device, args.semantic_classes)
     model_name = args.model_name or f"cpsam_finetune_last{args.unfreeze_blocks}_{time.strftime('%Y%m%d_%H%M%S')}"
 
     print(f"training model={model_name} on device={device}")
+    if args.semantic_classes > 0:
+        print(f"semantic segmentation enabled: classes_including_background={args.semantic_classes}")
+    else:
+        print("semantic segmentation disabled: training class-agnostic CPSAM outputs")
     print(f"unfreezing last {args.unfreeze_blocks} encoder blocks plus CPSAM heads")
     trainability_info = configure_trainable_params(
         net,
@@ -978,6 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "n_val_records": len(val_data),
                 "n_requested_val_records": len(val_records_loaded),
                 "n_test_records": len(test_records),
+                "semantic_classes": args.semantic_classes,
                 "npz_mask_channel": args.npz_mask_channel,
                 "npz_cache_dir": args.npz_cache_dir,
                 "channel_sampling_mode": args.channel_sampling_mode,

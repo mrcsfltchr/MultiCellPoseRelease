@@ -1,0 +1,139 @@
+#!/bin/bash
+#PBS -N semantic_full_balanced
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
+#PBS -l walltime=72:00:00
+#PBS -koed
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+ROOT_DIRS="${ROOT_DIRS:-$HOME/FoundationTrain $HOME/cpsamOODtest}"
+OUTPUT_DIR="${OUTPUT_DIR:-$HOME/MCP_paper/semantic_full_balanced_training}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
+
+BASE_MODEL="${BASE_MODEL:-cpsam}"
+MODEL_NAME="${MODEL_NAME:-guvpose_semantic_full_balanced}"
+SEMANTIC_CLASSES="${SEMANTIC_CLASSES:-4}"
+EPOCHS="${EPOCHS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+B_SIZE="${B_SIZE:-256}"
+MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
+MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
+NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
+NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
+NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/semantic_full_balanced_npz_cache}"
+CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
+MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
+CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-true}"
+UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-3}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+SCALE_RANGE="${SCALE_RANGE:-0.5}"
+SEG_LOSS_WEIGHT="${SEG_LOSS_WEIGHT:-0.1}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+TEST_RATIO="${TEST_RATIO:-0.1}"
+SEED="${SEED:-17}"
+EARLY_STOP="${EARLY_STOP:-false}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-5}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
+REDO_SPLITS="${REDO_SPLITS:-false}"
+
+cd "$REPO_DIR"
+
+module load "$CUDA_MODULE" 2>/dev/null || true
+
+if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+elif [ -x "$HOME/miniforge3/bin/conda" ]; then
+    eval "$($HOME/miniforge3/bin/conda shell.bash hook)"
+else
+    echo "ERROR: conda not found in $HOME/miniconda3 or $HOME/miniforge3"
+    exit 2
+fi
+conda activate "$CONDA_ENV"
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$NPZ_CACHE_DIR"
+
+if [ "$CHANNEL_SAMPLING_VAL" = "true" ] || [ "$CHANNEL_SAMPLING_VAL" = "1" ] || [ "$CHANNEL_SAMPLING_VAL" = "yes" ]; then
+    CHANNEL_SAMPLING_VAL_FLAG="--channel-sampling-val"
+else
+    CHANNEL_SAMPLING_VAL_FLAG="--no-channel-sampling-val"
+fi
+
+EXTRA_FLAGS=()
+if [ "$EARLY_STOP" = "true" ] || [ "$EARLY_STOP" = "1" ] || [ "$EARLY_STOP" = "yes" ]; then
+    EXTRA_FLAGS+=("--early-stop")
+fi
+if [ "$REDO_SPLITS" = "true" ] || [ "$REDO_SPLITS" = "1" ] || [ "$REDO_SPLITS" = "yes" ]; then
+    EXTRA_FLAGS+=("--redo-splits")
+fi
+
+echo "Job ID: ${PBS_JOBID:-unknown}"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+python -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
+echo "REPO_DIR=$REPO_DIR"
+echo "ROOT_DIRS=$ROOT_DIRS"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+echo "CONDA_ENV=$CONDA_ENV"
+echo "CUDA_MODULE=$CUDA_MODULE"
+echo "BASE_MODEL=$BASE_MODEL"
+echo "MODEL_NAME=$MODEL_NAME"
+echo "SEMANTIC_CLASSES=$SEMANTIC_CLASSES"
+echo "EPOCHS=$EPOCHS"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "B_SIZE=$B_SIZE"
+echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
+echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
+echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
+echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
+echo "NPZ_CACHE_DIR=$NPZ_CACHE_DIR"
+echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
+echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
+echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
+echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
+echo "LEARNING_RATE=$LEARNING_RATE"
+echo "WEIGHT_DECAY=$WEIGHT_DECAY"
+echo "SCALE_RANGE=$SCALE_RANGE"
+echo "SEG_LOSS_WEIGHT=$SEG_LOSS_WEIGHT"
+echo "EARLY_STOP=$EARLY_STOP"
+echo "EARLY_STOP_PATIENCE=$EARLY_STOP_PATIENCE"
+echo "EARLY_STOP_MIN_DELTA=$EARLY_STOP_MIN_DELTA"
+
+python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
+    --root-dirs $ROOT_DIRS \
+    --output-dir "$OUTPUT_DIR" \
+    --base-model "$BASE_MODEL" \
+    --model-name "$MODEL_NAME" \
+    --semantic-classes "$SEMANTIC_CLASSES" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --bsize "$B_SIZE" \
+    --max-train-records "$MAX_TRAIN_RECORDS" \
+    --max-val-records "$MAX_VAL_RECORDS" \
+    --nimg-per-epoch "$NIMG_PER_EPOCH" \
+    --npz-mask-channel "$NPZ_MASK_CHANNEL" \
+    --npz-cache-dir "$NPZ_CACHE_DIR" \
+    --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
+    --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
+    "$CHANNEL_SAMPLING_VAL_FLAG" \
+    --learning-rate "$LEARNING_RATE" \
+    --weight-decay "$WEIGHT_DECAY" \
+    --scale-range "$SCALE_RANGE" \
+    --seg-loss-weight "$SEG_LOSS_WEIGHT" \
+    --unfreeze-blocks "$UNFREEZE_BLOCKS" \
+    --val-ratio "$VAL_RATIO" \
+    --test-ratio "$TEST_RATIO" \
+    --seed "$SEED" \
+    --balance-mode source \
+    --early-stop-patience "$EARLY_STOP_PATIENCE" \
+    --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+    "${EXTRA_FLAGS[@]}"
+
+echo "Finish: $(date)"
