@@ -585,6 +585,43 @@ def limit_records(records: Sequence[dict], limit: int, seed: int) -> list[dict]:
     return selected[:limit]
 
 
+def parse_record_caps(items: Sequence[str]) -> list[tuple[str, int]]:
+    caps: list[tuple[str, int]] = []
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Invalid record cap {item!r}; expected MATCH=LIMIT")
+        match, limit_text = item.split("=", 1)
+        match = match.strip()
+        if not match:
+            raise ValueError(f"Invalid record cap {item!r}; MATCH cannot be empty")
+        try:
+            limit = int(limit_text)
+        except ValueError as exc:
+            raise ValueError(f"Invalid record cap {item!r}; LIMIT must be an integer") from exc
+        if limit < 0:
+            raise ValueError(f"Invalid record cap {item!r}; LIMIT must be >= 0")
+        caps.append((match.lower(), limit))
+    return caps
+
+
+def record_matches_cap(row: dict, match: str) -> bool:
+    image = str(row.get("image", "")).replace("\\", "/").lower()
+    label = str(row.get("label", "")).replace("\\", "/").lower()
+    source_group = str(row.get("source_group", "")).replace("\\", "/").lower()
+    return match in image or match in label or match in source_group
+
+
+def limit_records_by_path_caps(records: Sequence[dict], caps: Sequence[tuple[str, int]], seed: int) -> list[dict]:
+    selected = list(records)
+    for index, (match, limit) in enumerate(caps):
+        matched = [row for row in selected if record_matches_cap(row, match)]
+        unmatched = [row for row in selected if not record_matches_cap(row, match)]
+        capped = limit_records(matched, limit, seed + 1000 + index)
+        print(f"path cap {match!r}: {len(matched)} -> {len(capped)} training records")
+        selected = unmatched + capped
+    return selected
+
+
 def load_records(
     records: Sequence[dict],
     npz_mask_channel: str,
@@ -695,6 +732,16 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--unfreeze-blocks", type=int, default=9)
     parser.add_argument("--balance-mode", default="source", choices=("source", "none"))
     parser.add_argument("--max-train-records", type=int, default=0, help="Optional cap on unique training records loaded into memory.")
+    parser.add_argument(
+        "--max-train-records-by-path",
+        nargs="*",
+        default=(),
+        help=(
+            "Optional per-path training caps as MATCH=LIMIT, applied before "
+            "--max-train-records. MATCH is compared against image, label, and "
+            "source_group paths, e.g. FoundationTrain=500 cpsamOODtest=1500."
+        ),
+    )
     parser.add_argument("--max-val-records", type=int, default=0, help="Optional cap on validation records loaded into memory.")
     parser.add_argument("--nimg-per-epoch", type=int, default=0, help="Images sampled per epoch. Defaults to number of unique loaded training records.")
     parser.add_argument(
@@ -766,6 +813,10 @@ def parse_args(argv: Sequence[str] | None = None):
     args = parser.parse_args(argv)
     if args.semantic_classes < 0:
         parser.error("--semantic-classes must be >= 0")
+    try:
+        args.max_train_records_by_path = parse_record_caps(args.max_train_records_by_path)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not args.root_dirs and not args.data_dirs and not args.trainability_report_only:
         parser.error("Provide --root-dirs and/or --data-dirs")
     return args
@@ -883,7 +934,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_records = records_for_split(manifest.records, "train")
     val_records = records_for_split(manifest.records, "val")
     test_records = records_for_split(manifest.records, "test")
-    train_records_loaded = limit_records(train_records, args.max_train_records, args.seed)
+    train_records_capped = limit_records_by_path_caps(train_records, args.max_train_records_by_path, args.seed)
+    train_records_loaded = limit_records(train_records_capped, args.max_train_records, args.seed)
     val_records_loaded = limit_records(val_records, args.max_val_records, args.seed + 1)
     print(f"training records after cap: {len(train_records)} -> {len(train_records_loaded)}")
     print(f"held-out validation records: {len(val_records)}")
@@ -993,6 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "split_manifest": str(split_manifest_path),
                 "n_train_records": len(train_data),
                 "n_requested_train_records": len(train_records_loaded),
+                "max_train_records_by_path": args.max_train_records_by_path,
                 "n_val_records": len(val_data),
                 "n_requested_val_records": len(val_records_loaded),
                 "n_test_records": len(test_records),
