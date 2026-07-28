@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N semantic_full_balanced
-#PBS -l select=1:ncpus=16:ngpus=1:mem=32gb
+#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
 #PBS -l walltime=48:00:00
 #PBS -koed
 
@@ -21,7 +21,7 @@ B_SIZE="${B_SIZE:-256}"
 MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
 MAX_FOUNDATION_TRAIN_RECORDS="${MAX_FOUNDATION_TRAIN_RECORDS:-500}"
 MAX_NEW_DATASET_TRAIN_RECORDS="${MAX_NEW_DATASET_TRAIN_RECORDS:-500}"
-MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-0}"
+MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-200}"
 NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
 NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
 NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/semantic_full_balanced_npz_cache}"
