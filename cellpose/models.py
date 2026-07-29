@@ -491,7 +491,9 @@ class CellposeModel():
             # 2D case:
             prob = transforms.resize_image(prob, Ly=to_y_size, Lx=to_x_size, no_channels=True)
             if squeeze_happened:
-                prob = np.expand_dims(prob, int(np.argwhere(prob_shape == 1))) # add back empty axis for compatibility
+                for axis in np.flatnonzero(prob_shape == 1):
+                    if prob.ndim < len(prob_shape):
+                        prob = np.expand_dims(prob, int(axis)) # add back empty axis for compatibility
         elif prob.ndim == 3:
             # 3D case: 
             prob = transforms.resize_image(prob, Ly=to_y_size, Lx=to_x_size, no_channels=True)
@@ -535,7 +537,9 @@ class CellposeModel():
             grads = np.moveaxis(grads, -1, 0) # Put gradients first
 
             if squeeze_happened:
-                grads = np.expand_dims(grads, int(np.argwhere(grads_shape == 1))) # add back empty axis for compatibility
+                for axis in np.flatnonzero(grads_shape == 1):
+                    if grads.ndim < len(grads_shape):
+                        grads = np.expand_dims(grads, int(axis)) # add back empty axis for compatibility
         elif grads.ndim == 4:
             # dP has gradients that can be treated as channels:
             grads = grads.transpose(1, 2, 3, 0) # move gradients last:
