@@ -107,8 +107,18 @@ class SegmentationService:
         classes_map = None
         
         if styles is not None:
-            arr = np.squeeze(styles)
-            if arr.ndim >= 3 and arr.shape[-1] > 1:
+            arr = np.asarray(styles)
+            if arr.ndim >= 4 and arr.shape[0] == 1:
+                arr = arr[0]
+            else:
+                arr = np.squeeze(arr)
+            if arr.ndim == 3 and masks is not None:
+                mask_shape = tuple(np.squeeze(np.asarray(masks)).shape[-2:])
+                if arr.shape[:2] == mask_shape and arr.shape[-1] > 1:
+                    classes_map = np.argmax(arr, axis=-1).astype(np.int32)
+                elif arr.shape[1:] == mask_shape and arr.shape[0] > 1:
+                    classes_map = np.argmax(arr, axis=0).astype(np.int32)
+            elif arr.ndim >= 3 and arr.shape[-1] > 1:
                 classes_map = np.argmax(arr, axis=-1).astype(np.int32)
                 
         if classes_map is not None and masks is not None:
