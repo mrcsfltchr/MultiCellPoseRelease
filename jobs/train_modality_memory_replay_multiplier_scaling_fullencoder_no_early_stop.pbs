@@ -1,0 +1,159 @@
+#!/bin/bash
+#PBS -N cpsam_mod_replay_noes
+#PBS -l select=1:ncpus=12:ngpus=1:mem=32gb
+#PBS -l walltime=36:00:00
+#PBS -koed
+
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
+FOUNDATION_ROOT="${FOUNDATION_ROOT:-$HOME/FoundationTrain}"
+OOD_ROOT="${OOD_ROOT:-$HOME/cpsamOODtest}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/MCP_paper/modality_memory_replay_multiplier_scaling_fullencoder_no_early_stop}"
+CONDA_ENV="${CONDA_ENV:-mcp_pub}"
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
+
+MODALITIES="${MODALITIES:-Fluorescence Confocal PhaseContrast}"
+
+# Replay sizes are FoundationTrain train-record counts expressed as multiples
+# of each modality's selected cpsamOODtest train-record count.
+REPLAY_MULTIPLIERS="${REPLAY_MULTIPLIERS:-0 0.5 1 1.5 2 2.5 3}"
+OOD_TRAIN_RECORDS="${OOD_TRAIN_RECORDS:-0}"
+
+BASE_MODEL="${BASE_MODEL:-cpsam}"
+MODEL_PREFIX_BASE="${MODEL_PREFIX_BASE:-guvpose_modality_replay_noes}"
+EPOCHS="${EPOCHS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+B_SIZE="${B_SIZE:-256}"
+MAX_VAL_RECORDS="${MAX_VAL_RECORDS:-300}"
+NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
+NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
+NPZ_CACHE_ROOT="${NPZ_CACHE_ROOT:-${TMPDIR:-$HOME/ephemeral}/cpsam_modality_replay_multiplier_noes_npz_cache}"
+CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
+MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
+CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-false}"
+UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-24}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+SCALE_RANGE="${SCALE_RANGE:-0.5}"
+SEG_LOSS_WEIGHT="${SEG_LOSS_WEIGHT:-0.1}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+TEST_RATIO="${TEST_RATIO:-0.1}"
+SEED="${SEED:-17}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-5}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
+REDO_SPLITS="${REDO_SPLITS:-false}"
+
+cd "$REPO_DIR"
+
+module load "$CUDA_MODULE" 2>/dev/null || true
+
+if [ -x "$HOME/miniconda3/bin/conda" ]; then
+    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+elif [ -x "$HOME/miniforge3/bin/conda" ]; then
+    eval "$($HOME/miniforge3/bin/conda shell.bash hook)"
+else
+    echo "ERROR: conda not found in $HOME/miniconda3 or $HOME/miniforge3"
+    exit 2
+fi
+conda activate "$CONDA_ENV"
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+mkdir -p "$OUTPUT_ROOT"
+mkdir -p "$NPZ_CACHE_ROOT"
+
+if [ "$CHANNEL_SAMPLING_VAL" = "true" ] || [ "$CHANNEL_SAMPLING_VAL" = "1" ] || [ "$CHANNEL_SAMPLING_VAL" = "yes" ]; then
+    CHANNEL_SAMPLING_VAL_FLAG="--channel-sampling-val"
+else
+    CHANNEL_SAMPLING_VAL_FLAG="--no-channel-sampling-val"
+fi
+
+EXTRA_FLAGS=()
+if [ "$REDO_SPLITS" = "true" ] || [ "$REDO_SPLITS" = "1" ] || [ "$REDO_SPLITS" = "yes" ]; then
+    EXTRA_FLAGS+=("--redo-splits")
+fi
+
+echo "Job ID: ${PBS_JOBID:-unknown}"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+python -c "import torch; print('Torch:', torch.__version__); print('Torch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU count:', torch.cuda.device_count())"
+echo "REPO_DIR=$REPO_DIR"
+echo "FOUNDATION_ROOT=$FOUNDATION_ROOT"
+echo "OOD_ROOT=$OOD_ROOT"
+echo "OUTPUT_ROOT=$OUTPUT_ROOT"
+echo "CONDA_ENV=$CONDA_ENV"
+echo "CUDA_MODULE=$CUDA_MODULE"
+echo "MODALITIES=$MODALITIES"
+echo "REPLAY_MULTIPLIERS=$REPLAY_MULTIPLIERS"
+echo "OOD_TRAIN_RECORDS=$OOD_TRAIN_RECORDS"
+echo "BASE_MODEL=$BASE_MODEL"
+echo "MODEL_PREFIX_BASE=$MODEL_PREFIX_BASE"
+echo "EPOCHS=$EPOCHS"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "B_SIZE=$B_SIZE"
+echo "MAX_VAL_RECORDS=$MAX_VAL_RECORDS"
+echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
+echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
+echo "NPZ_CACHE_ROOT=$NPZ_CACHE_ROOT"
+echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
+echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
+echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
+echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
+echo "LEARNING_RATE=$LEARNING_RATE"
+echo "EARLY_STOP=false"
+echo "EARLY_STOP_PATIENCE=$EARLY_STOP_PATIENCE"
+echo "EARLY_STOP_MIN_DELTA=$EARLY_STOP_MIN_DELTA"
+
+for MODALITY in $MODALITIES; do
+    MODALITY_OUTPUT_ROOT="$OUTPUT_ROOT/$MODALITY"
+    MODALITY_NPZ_CACHE="$NPZ_CACHE_ROOT/$MODALITY"
+    SHARED_SPLIT_MANIFEST="$MODALITY_OUTPUT_ROOT/shared_foundation_${MODALITY}_splits.json"
+    MODEL_PREFIX="${MODEL_PREFIX_BASE}_${MODALITY}"
+
+    mkdir -p "$MODALITY_OUTPUT_ROOT"
+    mkdir -p "$MODALITY_NPZ_CACHE"
+
+    echo
+    echo "================================================================================"
+    echo "Training modality replay scaling for $MODALITY"
+    echo "Modality OOD root: $OOD_ROOT/$MODALITY"
+    echo "Output root: $MODALITY_OUTPUT_ROOT"
+    echo "Shared split manifest: $SHARED_SPLIT_MANIFEST"
+
+    python "$REPO_DIR/tools/run_memory_replay_scaling_experiment.py" \
+        --foundation-root "$FOUNDATION_ROOT" \
+        --ood-root "$OOD_ROOT/$MODALITY" \
+        --output-root "$MODALITY_OUTPUT_ROOT" \
+        --shared-split-manifest "$SHARED_SPLIT_MANIFEST" \
+        --replay-multipliers $REPLAY_MULTIPLIERS \
+        --ood-train-records "$OOD_TRAIN_RECORDS" \
+        --base-model "$BASE_MODEL" \
+        --model-prefix "$MODEL_PREFIX" \
+        --epochs "$EPOCHS" \
+        --batch-size "$BATCH_SIZE" \
+        --bsize "$B_SIZE" \
+        --learning-rate "$LEARNING_RATE" \
+        --weight-decay "$WEIGHT_DECAY" \
+        --scale-range "$SCALE_RANGE" \
+        --seg-loss-weight "$SEG_LOSS_WEIGHT" \
+        --unfreeze-blocks "$UNFREEZE_BLOCKS" \
+        --val-ratio "$VAL_RATIO" \
+        --test-ratio "$TEST_RATIO" \
+        --seed "$SEED" \
+        --max-val-records "$MAX_VAL_RECORDS" \
+        --nimg-per-epoch "$NIMG_PER_EPOCH" \
+        --balance-mode source \
+        --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
+        --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
+        "$CHANNEL_SAMPLING_VAL_FLAG" \
+        --npz-mask-channel "$NPZ_MASK_CHANNEL" \
+        --npz-cache-dir "$MODALITY_NPZ_CACHE" \
+        --early-stop-patience "$EARLY_STOP_PATIENCE" \
+        --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+        "${EXTRA_FLAGS[@]}"
+done
+
+echo "Finish: $(date)"
