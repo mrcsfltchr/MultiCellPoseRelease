@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N semantic_full_balanced
 #PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
-#PBS -l walltime=48:00:00
+#PBS -l walltime=18:00:00
 #PBS -koed
 
 set -euo pipefail
