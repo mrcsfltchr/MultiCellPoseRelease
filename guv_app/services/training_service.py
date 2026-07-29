@@ -211,9 +211,9 @@ def _train_seg_with_progress(
             X = torch.from_numpy(imgi).to(device)
             lbl = torch.from_numpy(lbl).to(device)
             y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
+            loss_seg = _loss_fn_seg(lbl, y, device)
             loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-            loss = loss + loss3
+            loss = float(config.seg_loss_weight) * loss_seg + loss3
 
             optimizer.zero_grad()
             loss.backward()
@@ -248,9 +248,9 @@ def _train_seg_with_progress(
                 X = torch.from_numpy(imgi).to(device)
                 lbl = torch.from_numpy(lbl).to(device)
                 y = net(X)[0]
-                loss = _loss_fn_seg(lbl, y, device)
+                loss_seg = _loss_fn_seg(lbl, y, device)
                 loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss = loss + loss3
+                loss = float(config.seg_loss_weight) * loss_seg + loss3
                 tavg += loss.item() * len(imgi)
                 tnsum += len(imgi)
                 tseg += loss.item() * len(imgi) if hasattr(loss, "item") else 0.0
@@ -567,6 +567,7 @@ class TrainingService:
             early_stop=False,
             model_name=config.model_name,
             class_weights=class_weights,
+            seg_loss_weight=config.seg_loss_weight,
             progress_callback=progress_callback,
         )
 

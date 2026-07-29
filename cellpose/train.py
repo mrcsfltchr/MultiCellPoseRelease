@@ -648,12 +648,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             t_to = time.perf_counter() - t0_to
             t0_fwd = time.perf_counter()
             y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
+            loss_seg = _loss_fn_seg(lbl, y, device)
+            loss = loss_seg
             loss3 = None
             if y.shape[1] > 3:
                 # train_logger.info(f">>> calculating class loss ...")
                 loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss = loss + loss3
+                loss = float(seg_loss_weight) * loss_seg + loss3
             t_fwd = time.perf_counter() - t0_fwd
             t0_bwd = time.perf_counter()
             optimizer.zero_grad()
@@ -729,11 +730,12 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         t_to = time.perf_counter() - t0_to
                         t0_fwd = time.perf_counter()
                         y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
+                        loss_seg = _loss_fn_seg(lbl, y, device)
+                        loss = loss_seg
                         loss3 = None
                         if y.shape[1] > 3:
                             loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                            loss = loss + loss3            
+                            loss = float(seg_loss_weight) * loss_seg + loss3
                         t_fwd = time.perf_counter() - t0_fwd
                         test_loss = loss.item()
                         test_class_loss = loss3.item() if loss3 is not None else 0.0

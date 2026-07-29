@@ -34,9 +34,15 @@ import tifffile
 import torch
 from PIL import Image
 
+from cellpose import dynamics
 from cellpose import models as cp_models
 from cellpose import train as cellpose_train
 from cellpose.models import CellposeModel
+from cellpose.semantic_class_weights import (
+    compute_class_weights_from_class_maps,
+    infer_semantic_nclasses_from_net,
+)
+from cellpose.semantic_label_utils import build_classes_map_from_masks, sanitize_class_map
 from cellpose.training_mode_utils import configure_trainable_params
 from guv_app.services.image_service import ImageService
 from guv_app.services.training_dataset_service import _load_seg_npy_compat
@@ -523,6 +529,104 @@ def load_mask(
     return masks.astype(np.int32, copy=False)
 
 
+def load_label_components(
+    label_path: str | Path,
+    frame_id: str | None = None,
+    npz_mask_channel: str = "last",
+    npz_cache_dir: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Load an instance mask and optional semantic class map from a label file."""
+    label_path = Path(label_path)
+    suffix = label_path.suffix.lower()
+    class_map = None
+    class_names = None
+    classes = None
+    if suffix == ".npz":
+        masks = load_npz_item(label_path, frame_id, "mask", npz_cache_dir=npz_cache_dir)
+    elif suffix == ".npy":
+        dat = _load_seg_npy_compat(str(label_path))
+        masks = dat.get("masks")
+        class_map = dat.get("classes_map")
+        classes = dat.get("classes")
+        class_names = dat.get("class_names")
+    elif suffix in (".tif", ".tiff"):
+        masks = tifffile.imread(label_path)
+        for cls_suffix in ("_classes.tif", "_classes.tiff", "_classes.png"):
+            cls_path = label_path.with_name(label_path.stem.replace("_masks", "").replace("_mask", "") + cls_suffix)
+            if cls_path.exists():
+                class_map = tifffile.imread(cls_path) if cls_path.suffix.lower() in (".tif", ".tiff") else np.asarray(Image.open(cls_path))
+                break
+    elif suffix == ".png":
+        with Image.open(label_path) as img:
+            masks = np.asarray(img)
+        cls_path = label_path.with_name(label_path.stem.replace("_masks", "").replace("_mask", "") + "_classes.png")
+        if cls_path.exists():
+            with Image.open(cls_path) as cls_img:
+                class_map = np.asarray(cls_img)
+    else:
+        raise ValueError(f"Unsupported label file type: {label_path}")
+
+    if masks is None:
+        raise ValueError(f"Label file has no masks: {label_path}")
+    masks = coerce_mask_2d(
+        masks,
+        npz_mask_channel=npz_mask_channel,
+        label_path=label_path,
+        allow_channel_select=suffix == ".npz",
+    ).astype(np.int32, copy=False)
+    if class_map is None and classes is not None:
+        class_map = build_classes_map_from_masks(masks, classes)
+    if class_map is not None:
+        class_map = sanitize_class_map(
+            class_map,
+            masks=masks,
+            classes=classes,
+            class_names=class_names,
+        )
+    return masks, class_map
+
+
+def insert_class_map(flow_labels: Sequence[np.ndarray], class_maps: Sequence[np.ndarray | None]) -> list[np.ndarray]:
+    """Insert semantic class maps after the mask channel in precomputed flow labels."""
+    updated: list[np.ndarray] = []
+    for idx, lbl in enumerate(flow_labels):
+        cmap = class_maps[idx] if idx < len(class_maps) else None
+        try:
+            arr = np.asarray(lbl)
+            if arr.ndim != 3:
+                updated.append(arr)
+                continue
+            if cmap is not None:
+                cmap = np.squeeze(np.asarray(cmap))
+            if cmap is None or getattr(cmap, "ndim", 0) != 2 or tuple(cmap.shape) != tuple(arr.shape[1:]):
+                cmap_arr = np.zeros(arr.shape[1:], dtype=np.int64)
+            else:
+                cmap_arr = np.rint(cmap).astype(np.int64, copy=False)
+                cmap_arr = np.clip(cmap_arr, 0, max(0, int(np.max(cmap_arr))))
+            if arr.shape[0] >= 5:
+                combined = np.concatenate((arr[:1], cmap_arr[np.newaxis, ...], arr[2:]), axis=0)
+            else:
+                combined = np.concatenate((arr[:1], cmap_arr[np.newaxis, ...], arr[1:]), axis=0)
+            updated.append(combined.astype(np.float32, copy=False))
+        except Exception:
+            updated.append(np.asarray(lbl))
+    return updated
+
+
+def valid_class_maps(class_maps: Sequence[np.ndarray | None]) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for class_map in class_maps:
+        if class_map is None:
+            continue
+        try:
+            cmap = np.squeeze(np.asarray(class_map))
+            if cmap.ndim == 2:
+                out.append(np.rint(cmap).astype(np.int64, copy=False))
+        except Exception:
+            continue
+    return out
+
+
 def load_image_ref(
     image_service: ImageService,
     image: str,
@@ -629,11 +733,12 @@ def load_records(
     max_all_channel_combos: int,
     seed: int,
     npz_cache_dir: str | Path | None,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[dict], list[str]]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray | None], list[str], list[dict], list[str]]:
     image_service = ImageService()
     rng = random.Random(seed)
     data: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    class_maps: list[np.ndarray | None] = []
     files: list[str] = []
     valid_records: list[dict] = []
     invalid: list[str] = []
@@ -641,7 +746,7 @@ def load_records(
         frame_id = row.get("frame_id") or None
         try:
             image = load_image_ref(image_service, row["image"], frame_id, npz_cache_dir=npz_cache_dir)
-            mask = load_mask(
+            mask, class_map = load_label_components(
                 row["label"],
                 frame_id=frame_id,
                 npz_mask_channel=npz_mask_channel,
@@ -651,6 +756,7 @@ def load_records(
             for view_name, channels in specs:
                 data.append(make_three_channel_view(image, channels))
                 labels.append(mask)
+                class_maps.append(class_map)
                 file_ref = f"{row['image']}::{frame_id}" if frame_id else row["image"]
                 files.append(f"{file_ref}::channels={view_name}")
                 valid_row = dict(row)
@@ -665,7 +771,7 @@ def load_records(
         print(f"skipped {len(invalid)} invalid records")
         for line in invalid[:20]:
             print(f"  {line}")
-    return data, labels, files, valid_records, invalid
+    return data, labels, class_maps, files, valid_records, invalid
 
 
 def summarize(records: Sequence[dict]) -> None:
@@ -944,7 +1050,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    train_data, train_labels, train_files, valid_train_records, train_invalid = load_records(
+    train_data, train_labels, train_class_maps, train_files, valid_train_records, train_invalid = load_records(
         train_records_loaded,
         args.npz_mask_channel,
         args.channel_sampling_mode,
@@ -952,7 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.seed,
         args.npz_cache_dir,
     )
-    val_data, val_labels, val_files, valid_val_records, val_invalid = load_records(
+    val_data, val_labels, val_class_maps, val_files, valid_val_records, val_invalid = load_records(
         val_records_loaded,
         args.npz_mask_channel,
         args.channel_sampling_mode if args.channel_sampling_val else "none",
@@ -971,6 +1077,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"valid validation records loaded: {len(val_data)}/{len(val_records_loaded)}")
     if len(train_data) != len(train_labels):
         raise ValueError(f"Internal loader error: train data/labels length mismatch ({len(train_data)} != {len(train_labels)})")
+    if len(train_data) != len(train_class_maps):
+        raise ValueError(
+            f"Internal loader error: train data/class-map length mismatch ({len(train_data)} != {len(train_class_maps)})"
+        )
     if train_probs is not None and len(train_probs) != len(train_data):
         raise ValueError(f"Internal loader error: train probabilities/data length mismatch ({len(train_probs)} != {len(train_data)})")
 
@@ -1008,13 +1118,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         net.diam_labels = torch.nn.Parameter(torch.tensor([30.0], device=device), requires_grad=False)
     normalize_params = dict(cp_models.normalize_default)
     normalize_params["normalize"] = True
+    class_weights = None
+    train_labels_for_training = train_labels
+    val_labels_for_training = val_labels
+    if args.semantic_classes > 0:
+        valid_train_class_maps = valid_class_maps(train_class_maps)
+        max_class_id = max((int(np.max(cm)) for cm in valid_train_class_maps), default=-1)
+        inferred_nclasses = infer_semantic_nclasses_from_net(net)
+        class_weights = compute_class_weights_from_class_maps(
+            valid_train_class_maps,
+            nclasses=args.semantic_classes if args.semantic_classes > 0 else inferred_nclasses,
+        )
+        print(
+            "semantic class-weight inputs: "
+            f"valid_class_maps={len(valid_train_class_maps)} max_class_id={max_class_id} "
+            f"inferred_nclasses={inferred_nclasses}"
+        )
+        if class_weights is not None:
+            print(f"semantic class weights ({len(class_weights)} classes incl. background): {class_weights.tolist()}")
+        else:
+            print("semantic class weights unavailable; using unweighted cross entropy")
+        print("precomputing semantic flow labels with class-map channel")
+        train_flow_labels = dynamics.labels_to_flows(train_labels, files=None, device=device)
+        train_labels_for_training = insert_class_map(train_flow_labels, train_class_maps)
+        if val_labels:
+            val_flow_labels = dynamics.labels_to_flows(val_labels, files=None, device=device)
+            val_labels_for_training = insert_class_map(val_flow_labels, val_class_maps)
     model_path, train_losses, val_losses = cellpose_train.train_seg(
         net,
         train_data=train_data,
-        train_labels=train_labels,
+        train_labels=train_labels_for_training,
         train_probs=train_probs,
         test_data=val_data if args.use_validation_as_test and val_data else None,
-        test_labels=val_labels if args.use_validation_as_test and val_labels else None,
+        test_labels=val_labels_for_training if args.use_validation_as_test and val_data else None,
         train_files=None,
         test_files=None,
         normalize=normalize_params,
@@ -1034,6 +1170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_delta=args.early_stop_min_delta,
         model_name=model_name,
         seg_loss_weight=args.seg_loss_weight,
+        class_weights=class_weights,
     )
     result_path = output_dir / "training_result.json"
     result_path.write_text(
@@ -1050,6 +1187,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "n_requested_val_records": len(val_records_loaded),
                 "n_test_records": len(test_records),
                 "semantic_classes": args.semantic_classes,
+                "semantic_class_weights": class_weights.tolist() if class_weights is not None else None,
+                "semantic_class_weighted_loss": bool(class_weights is not None),
+                "semantic_valid_class_maps": len(valid_class_maps(train_class_maps)) if args.semantic_classes > 0 else 0,
                 "npz_mask_channel": args.npz_mask_channel,
                 "npz_cache_dir": args.npz_cache_dir,
                 "channel_sampling_mode": args.channel_sampling_mode,
