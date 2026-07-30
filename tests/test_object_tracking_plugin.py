@@ -12,6 +12,16 @@ def _frame(objects, shape=(32, 32)):
     return image, masks
 
 
+def _multichannel_frame(objects, shape=(32, 32), channels=3):
+    masks = np.zeros(shape, dtype=np.int32)
+    image = np.zeros((*shape, channels), dtype=np.float32)
+    for mid, y0, x0, size, intensities in objects:
+        masks[y0:y0 + size, x0:x0 + size] = mid
+        for channel, intensity in enumerate(intensities):
+            image[y0:y0 + size, x0:x0 + size, channel] = intensity
+    return image, masks
+
+
 def test_tracking_matches_objects_and_creates_new_tracks_for_births():
     plugin = ObjectTrackingPlugin()
     img0, m0 = _frame([(1, 4, 4, 4, 10.0), (2, 20, 20, 4, 80.0)])
@@ -72,6 +82,56 @@ def test_tracking_uses_area_and_intensity_to_reduce_identity_swaps():
     by_mask = df1.set_index("mask_id")
     assert int(by_mask.loc[1, "track_id"]) == 1
     assert int(by_mask.loc[2, "track_id"]) == 2
+
+
+def test_tracking_channels_and_measurement_channels_are_independent():
+    plugin = ObjectTrackingPlugin()
+    img0, m0 = _multichannel_frame(
+        [
+            (1, 5, 5, 4, [10.0, 100.0, 1000.0]),
+            (2, 5, 20, 4, [90.0, 20.0, 2000.0]),
+        ]
+    )
+    img1, m1 = _multichannel_frame(
+        [
+            (1, 5, 5, 4, [91.0, 21.0, 2100.0]),
+            (2, 5, 20, 4, [11.0, 99.0, 1100.0]),
+        ]
+    )
+
+    plugin.run(
+        img0,
+        m0,
+        filename="movie.tif::T0",
+        tracking_channels="2",
+        measurement_channels="1,3",
+        distance_weight=0,
+        area_weight=0,
+        shape_weight=0,
+        intensity_weight=1,
+    )
+    df1 = plugin.run(
+        img1,
+        m1,
+        filename="movie.tif::T1",
+        tracking_channels="2",
+        measurement_channels="1,3",
+        distance_weight=0,
+        area_weight=0,
+        shape_weight=0,
+        intensity_weight=1,
+    )
+
+    by_mask = df1.set_index("mask_id")
+    assert int(by_mask.loc[2, "track_id"]) == 1
+    assert int(by_mask.loc[1, "track_id"]) == 2
+    assert "tracking_mean_intensity" in df1.columns
+    assert "mean_intensity_ch1" in df1.columns
+    assert "mean_intensity_ch3" in df1.columns
+    assert "mean_intensity_ch2" not in df1.columns
+    assert float(by_mask.loc[2, "tracking_mean_intensity"]) == 99.0
+    assert float(by_mask.loc[2, "mean_intensity_ch1"]) == 11.0
+    assert float(by_mask.loc[2, "mean_intensity_ch3"]) == 1100.0
 
 
 def test_position_only_frames_do_not_track_as_timepoints():

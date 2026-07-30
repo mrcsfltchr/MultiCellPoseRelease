@@ -19,7 +19,9 @@ class _Detection:
     area: float
     centroid_y: float
     centroid_x: float
+    tracking_intensity: float
     mean_intensity: float
+    measurement_intensities: Dict[str, float]
     perimeter: float
     circularity: float
     aspect_ratio: float
@@ -54,12 +56,17 @@ class ObjectTrackingPlugin(AnalysisPlugin):
 
     def get_parameter_definitions(self):
         return {
-            "intensity_channel": {
-                "type": "enum",
+            "tracking_channels": {
+                "type": "str",
                 "default": "all",
-                "options": ["all", "1", "2", "3"],
-                "label": "Intensity Channel",
-                "help": "'all' averages channels; 1/2/3 selects one fluorescence channel.",
+                "label": "Tracking Channels",
+                "help": "Channels used for object matching. Use 'all' or comma-separated one-based channels, e.g. 1,3.",
+            },
+            "measurement_channels": {
+                "type": "str",
+                "default": "all",
+                "label": "Measurement Channels",
+                "help": "Channels measured for each final track. Use 'all' or comma-separated one-based channels, e.g. 1,2.",
             },
             "max_displacement_px": {
                 "type": "float",
@@ -151,9 +158,12 @@ class ObjectTrackingPlugin(AnalysisPlugin):
             self._last_frame_index = frame_index
             return pd.DataFrame()
 
-        image2d = _align_image_to_masks(image, masks2d, kwargs.get("intensity_channel", "all"))
+        image_channels = _align_channels_to_masks(image, masks2d)
+        tracking_image = _combine_channels(image_channels, _tracking_channel_setting(kwargs))
+        measurement_images = _measurement_channel_images(image_channels, kwargs.get("measurement_channels", "all"))
         detections = _extract_detections(
-            image2d,
+            tracking_image,
+            measurement_images,
             masks2d,
             classes=classes,
             frame_index=frame_index,
@@ -173,10 +183,13 @@ class ObjectTrackingPlugin(AnalysisPlugin):
             if masks2d is None:
                 continue
             image_frame = _slice_image_frame(image, frame_index)
-            image2d = _align_image_to_masks(image_frame, masks2d, kwargs.get("intensity_channel", "all"))
+            image_channels = _align_channels_to_masks(image_frame, masks2d)
+            tracking_image = _combine_channels(image_channels, _tracking_channel_setting(kwargs))
+            measurement_images = _measurement_channel_images(image_channels, kwargs.get("measurement_channels", "all"))
             frame_classes = _slice_classes(classes, frame_index)
             detections = _extract_detections(
-                image2d,
+                tracking_image,
+                measurement_images,
                 masks2d,
                 classes=frame_classes,
                 frame_index=frame_index,
@@ -321,27 +334,36 @@ def _slice_classes(classes, frame_index: int):
     return arr
 
 
-def _align_image_to_masks(image, masks2d: np.ndarray, intensity_channel="all") -> Optional[np.ndarray]:
+def _align_channels_to_masks(image, masks2d: np.ndarray) -> List[np.ndarray]:
     if image is None:
-        return None
+        return []
     arr = np.asarray(image)
     if arr.ndim == 2:
-        return arr.astype(np.float64, copy=False) if arr.shape == masks2d.shape else None
+        return [arr.astype(np.float64, copy=False)] if arr.shape == masks2d.shape else []
     arr = np.squeeze(arr)
     if arr.ndim == 2:
-        return arr.astype(np.float64, copy=False) if arr.shape == masks2d.shape else None
+        return [arr.astype(np.float64, copy=False)] if arr.shape == masks2d.shape else []
     if arr.ndim != 3:
-        return None
+        return []
 
     channels = _extract_channels(arr, masks2d.shape)
-    if not channels:
+    return channels
+
+
+def _combine_channels(channels: List[np.ndarray], setting="all") -> Optional[np.ndarray]:
+    selected = _select_channels(channels, setting)
+    if not selected:
         return None
-    idx = _parse_channel(intensity_channel)
-    if idx is None:
-        return np.mean(np.stack(channels, axis=0), axis=0)
-    if idx < 0 or idx >= len(channels):
-        return channels[0]
-    return channels[idx]
+    if len(selected) == 1:
+        return selected[0]
+    return np.mean(np.stack(selected, axis=0), axis=0)
+
+
+def _measurement_channel_images(channels: List[np.ndarray], setting="all") -> Dict[str, np.ndarray]:
+    if not channels:
+        return {}
+    indices = _parse_channel_indices(setting, len(channels))
+    return {f"mean_intensity_ch{idx + 1}": channels[idx] for idx in indices}
 
 
 def _extract_channels(arr: np.ndarray, shape: Tuple[int, int]) -> List[np.ndarray]:
@@ -350,6 +372,34 @@ def _extract_channels(arr: np.ndarray, shape: Tuple[int, int]) -> List[np.ndarra
     if arr.shape[1:] == shape and arr.shape[0] <= 8:
         return [arr[c].astype(np.float64, copy=False) for c in range(arr.shape[0])]
     return []
+
+
+def _tracking_channel_setting(kwargs) -> str:
+    if "tracking_channels" in kwargs and str(kwargs.get("tracking_channels", "")).strip():
+        return kwargs.get("tracking_channels")
+    return kwargs.get("intensity_channel", "all")
+
+
+def _select_channels(channels: List[np.ndarray], setting="all") -> List[np.ndarray]:
+    return [channels[idx] for idx in _parse_channel_indices(setting, len(channels))]
+
+
+def _parse_channel_indices(setting, channel_count: int) -> List[int]:
+    if channel_count <= 0:
+        return []
+    text = "" if setting is None else str(setting).strip().lower()
+    if text in {"", "all", "*"}:
+        return list(range(channel_count))
+    indices = []
+    for token in re.split(r"[,; ]+", text):
+        if not token:
+            continue
+        idx = _parse_channel(token)
+        if idx is None:
+            continue
+        if 0 <= idx < channel_count and idx not in indices:
+            indices.append(idx)
+    return indices or list(range(channel_count))
 
 
 def _parse_channel(value) -> Optional[int]:
@@ -362,7 +412,8 @@ def _parse_channel(value) -> Optional[int]:
 
 
 def _extract_detections(
-    image2d: Optional[np.ndarray],
+    tracking_image: Optional[np.ndarray],
+    measurement_images: Dict[str, np.ndarray],
     masks2d: np.ndarray,
     classes: np.ndarray = None,
     frame_index: int = 0,
@@ -376,10 +427,14 @@ def _extract_detections(
     yy, xx = np.indices(masks2d.shape)
     sum_y = np.bincount(flat, weights=yy.ravel(), minlength=max_label + 1)
     sum_x = np.bincount(flat, weights=xx.ravel(), minlength=max_label + 1)
-    if image2d is not None:
-        intensity_sum = np.bincount(flat, weights=np.asarray(image2d).ravel(), minlength=max_label + 1)
+    if tracking_image is not None:
+        tracking_sum = np.bincount(flat, weights=np.asarray(tracking_image).ravel(), minlength=max_label + 1)
     else:
-        intensity_sum = np.full(max_label + 1, np.nan, dtype=np.float64)
+        tracking_sum = np.full(max_label + 1, np.nan, dtype=np.float64)
+    measurement_sums = {
+        name: np.bincount(flat, weights=np.asarray(image).ravel(), minlength=max_label + 1)
+        for name, image in measurement_images.items()
+    }
 
     perimeter = _perimeter_by_label(masks2d, max_label)
     detections = []
@@ -392,6 +447,11 @@ def _extract_detections(
         width = max(1, int(xs.max() - xs.min() + 1))
         aspect_ratio = float(width / height)
         circ = float(4.0 * np.pi * area[mask_id] / max(perimeter[mask_id] ** 2, 1.0))
+        measured = {
+            name: float(values[mask_id] / area[mask_id])
+            for name, values in measurement_sums.items()
+        }
+        measured_mean = float(np.nanmean(list(measured.values()))) if measured else np.nan
         detections.append(
             _Detection(
                 frame_index=int(frame_index),
@@ -400,7 +460,9 @@ def _extract_detections(
                 area=float(area[mask_id]),
                 centroid_y=float(sum_y[mask_id] / area[mask_id]),
                 centroid_x=float(sum_x[mask_id] / area[mask_id]),
-                mean_intensity=float(intensity_sum[mask_id] / area[mask_id]) if image2d is not None else np.nan,
+                tracking_intensity=float(tracking_sum[mask_id] / area[mask_id]) if tracking_image is not None else np.nan,
+                mean_intensity=measured_mean,
+                measurement_intensities=measured,
                 perimeter=float(perimeter[mask_id]),
                 circularity=circ,
                 aspect_ratio=aspect_ratio,
@@ -442,7 +504,7 @@ def _match_cost(det: _Detection, prev: _Detection, gap: int, **kwargs) -> Tuple[
 
     dist_cost = distance / max_disp
     area_cost = abs(np.log((det.area + 1.0) / (prev.area + 1.0)))
-    intensity_cost = _relative_difference(det.mean_intensity, prev.mean_intensity)
+    intensity_cost = _relative_difference(det.tracking_intensity, prev.tracking_intensity)
     shape_cost = (
         abs(det.circularity - prev.circularity) +
         abs(np.log((det.aspect_ratio + 1e-6) / (prev.aspect_ratio + 1e-6)))
@@ -464,7 +526,7 @@ def _relative_difference(a: float, b: float) -> float:
 
 
 def _row_from_detection(det: _Detection, track_id: int, status: str, age: int, cost: float, distance: float, gap: int) -> dict:
-    return {
+    row = {
         "frame_index": int(det.frame_index),
         "mask_id": int(det.mask_id),
         "track_id": int(track_id),
@@ -477,8 +539,11 @@ def _row_from_detection(det: _Detection, track_id: int, status: str, age: int, c
         "area": det.area,
         "centroid_y": det.centroid_y,
         "centroid_x": det.centroid_x,
+        "tracking_mean_intensity": det.tracking_intensity,
         "mean_intensity": det.mean_intensity,
         "perimeter": det.perimeter,
         "circularity": det.circularity,
         "aspect_ratio": det.aspect_ratio,
     }
+    row.update(det.measurement_intensities)
+    return row

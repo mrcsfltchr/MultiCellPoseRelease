@@ -1,5 +1,4 @@
 import argparse
-import os
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -14,6 +13,7 @@ def export_tracking_timeseries_csvs(
     input_csv: str,
     output_dir: Optional[str] = None,
     intensity_column: str = "mean_intensity",
+    intensity_columns=None,
     area_column: str = "area",
     overwrite: bool = False,
 ) -> List[str]:
@@ -25,7 +25,12 @@ def export_tracking_timeseries_csvs(
     """
     input_path = Path(input_csv)
     df = pd.read_csv(input_path)
-    _validate_tracking_table(df, intensity_column=intensity_column, area_column=area_column)
+    resolved_intensity_columns = _resolve_intensity_columns(
+        df,
+        intensity_column=intensity_column,
+        intensity_columns=intensity_columns,
+    )
+    _validate_tracking_table(df, intensity_columns=resolved_intensity_columns, area_column=area_column)
 
     out_dir = Path(output_dir) if output_dir else input_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -35,6 +40,7 @@ def export_tracking_timeseries_csvs(
         wide = reshape_tracking_timeseries(
             series_df,
             intensity_column=intensity_column,
+            intensity_columns=resolved_intensity_columns,
             area_column=area_column,
         )
         out_path = out_dir / f"{_safe_filename(series_key)}_object_tracking_timeseries.csv"
@@ -48,34 +54,61 @@ def export_tracking_timeseries_csvs(
 def reshape_tracking_timeseries(
     df: pd.DataFrame,
     intensity_column: str = "mean_intensity",
+    intensity_columns=None,
     area_column: str = "area",
 ) -> pd.DataFrame:
+    resolved_intensity_columns = _resolve_intensity_columns(
+        df,
+        intensity_column=intensity_column,
+        intensity_columns=intensity_columns,
+    )
     track_ids = sorted(df["track_id"].dropna().astype(int).unique())
     frames = sorted(df["frame_index"].dropna().astype(int).unique())
     wide = pd.DataFrame({"frame_index": frames})
 
     for track_id in track_ids:
         track_df = df[df["track_id"].astype(int) == track_id]
-        intensity_by_frame = _series_by_frame(track_df, intensity_column)
         area_by_frame = _series_by_frame(track_df, area_column)
         title = f"track_{track_id}"
-        wide[f"{title}_{intensity_column}"] = wide["frame_index"].map(intensity_by_frame)
+        for column in resolved_intensity_columns:
+            intensity_by_frame = _series_by_frame(track_df, column)
+            wide[f"{title}_{column}"] = wide["frame_index"].map(intensity_by_frame)
         wide[f"{title}_{area_column}"] = wide["frame_index"].map(area_by_frame)
     return wide
 
 
 def _validate_tracking_table(
     df: pd.DataFrame,
-    intensity_column: str = "mean_intensity",
+    intensity_columns=None,
     area_column: str = "area",
 ) -> None:
-    required = {"frame_index", "track_id", intensity_column, area_column}
+    required = {"frame_index", "track_id", area_column}
+    required.update(intensity_columns or ["mean_intensity"])
     missing = sorted(required.difference(df.columns))
     if missing:
         raise ValueError(
             "Input CSV does not look like Object Tracking output. "
             f"Missing columns: {', '.join(missing)}"
         )
+
+
+def _resolve_intensity_columns(
+    df: pd.DataFrame,
+    intensity_column: str = "mean_intensity",
+    intensity_columns=None,
+) -> List[str]:
+    if intensity_columns is None:
+        return [intensity_column]
+    if isinstance(intensity_columns, str):
+        text = intensity_columns.strip()
+        if not text or text.lower() == "auto":
+            measured = sorted(
+                [col for col in df.columns if re.fullmatch(r"mean_intensity_ch\d+", str(col))],
+                key=lambda col: int(re.search(r"\d+", str(col)).group(0)),
+            )
+            return measured or [intensity_column]
+        return [part.strip() for part in re.split(r"[,; ]+", text) if part.strip()]
+    return [str(col).strip() for col in intensity_columns if str(col).strip()]
 
 
 def _iter_timeseries(df: pd.DataFrame, fallback_name: str) -> Iterable[Tuple[str, pd.DataFrame]]:
@@ -144,7 +177,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--intensity-column",
         default="mean_intensity",
-        help="Tracking output column to use for intensity values.",
+        help="Single intensity column to export when --intensity-columns is not set.",
+    )
+    parser.add_argument(
+        "--intensity-columns",
+        default="auto",
+        help=(
+            "Intensity columns to export. Use 'auto' to export measured channel columns "
+            "such as mean_intensity_ch1, or pass a comma-separated list."
+        ),
     )
     parser.add_argument(
         "--area-column",
@@ -158,6 +199,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.input_csv,
         output_dir=args.output_dir,
         intensity_column=args.intensity_column,
+        intensity_columns=args.intensity_columns,
         area_column=args.area_column,
         overwrite=args.overwrite,
     )

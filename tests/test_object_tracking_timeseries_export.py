@@ -31,6 +31,28 @@ def test_reshape_tracking_timeseries_pairs_intensity_and_area_by_track():
     assert pd.isna(wide["track_2_area"].iloc[1])
 
 
+def test_reshape_tracking_timeseries_auto_exports_measured_channel_columns():
+    df = pd.DataFrame(
+        {
+            "frame_index": [0, 1],
+            "track_id": [1, 1],
+            "mean_intensity": [15.0, 16.0],
+            "mean_intensity_ch1": [10.0, 11.0],
+            "mean_intensity_ch3": [20.0, 21.0],
+            "area": [100, 101],
+        }
+    )
+
+    wide = reshape_tracking_timeseries(df, intensity_columns="auto")
+
+    assert wide.columns.tolist() == [
+        "frame_index",
+        "track_1_mean_intensity_ch1",
+        "track_1_mean_intensity_ch3",
+        "track_1_area",
+    ]
+
+
 def test_export_tracking_timeseries_writes_one_file_per_position_series(tmp_path):
     input_csv = tmp_path / "statistics_results__Object_Tracking.csv"
     pd.DataFrame(
