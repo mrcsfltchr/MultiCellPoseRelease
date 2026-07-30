@@ -152,6 +152,8 @@ class AnalysisService:
             # 2. Override with any user-provided parameters
             if plugin_params and name in plugin_params:
                 params.update(plugin_params[name])
+            if filename:
+                params.setdefault("filename", filename)
 
             try:
                 df = plugin.run(image, masks, classes=classes, **params)
