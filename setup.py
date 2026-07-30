@@ -124,4 +124,5 @@ setup(
         'multicellpose-gui = guv_app.main:main',
         'multicellpose-server = run_server:main',
         'multicellpose-train = train_headless:main',
+        'multicellpose-tracking-timeseries = guv_app.plugins.object_tracking_timeseries_export:main',
     ]})
