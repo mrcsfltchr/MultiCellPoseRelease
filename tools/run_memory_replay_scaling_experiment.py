@@ -82,6 +82,11 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--redo-splits", action="store_true")
+    parser.add_argument(
+        "--skip-completed",
+        action="store_true",
+        help="Skip replay runs whose output directory already contains training_result.json.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args, extra = parser.parse_known_args(argv)
     return args, extra
@@ -386,6 +391,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"cpsamOODtest={run['composition']['selected_ood_train_records']})"
         )
         print(quote_cmd(run["command"]))
+        result_path = Path(run["composition"]["split_manifest"]).parent / "training_result.json"
+        if args.skip_completed and result_path.exists():
+            print(f"skipping completed run: {result_path}")
+            continue
         if not args.dry_run:
             subprocess.run(run["command"], check=True)
 
