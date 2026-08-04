@@ -161,3 +161,15 @@ def test_multi_position_time_series_tracks_within_position_only():
     assert df1.iloc[0]["status"] == "matched"
     assert int(df_other_position.iloc[0]["track_id"]) == 1
     assert df_other_position.iloc[0]["status"] == "new"
+
+
+def test_tracking_filters_to_approved_track_ids():
+    plugin = ObjectTrackingPlugin()
+    img0, m0 = _frame([(1, 4, 4, 4, 10.0), (2, 20, 20, 4, 80.0)])
+    img1, m1 = _frame([(1, 5, 5, 4, 11.0), (2, 21, 21, 4, 79.0)])
+
+    plugin.run(img0, m0, filename="movie.tif::T0")
+    df1 = plugin.run(img1, m1, filename="movie.tif::T1", approved_track_ids=[2])
+
+    assert df1["track_id"].tolist() == [2]
+    assert df1["mask_id"].tolist() == [2]

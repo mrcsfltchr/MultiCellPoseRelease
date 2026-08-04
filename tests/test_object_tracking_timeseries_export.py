@@ -1,8 +1,11 @@
 import pandas as pd
+import numpy as np
 
+from guv_app.plugins.object_tracking import ObjectTrackingPlugin
 from guv_app.plugins.object_tracking_timeseries_export import (
     export_tracking_timeseries_csvs,
     reshape_tracking_timeseries,
+    tracking_timeseries_tables,
 )
 
 
@@ -20,15 +23,15 @@ def test_reshape_tracking_timeseries_pairs_intensity_and_area_by_track():
 
     assert wide.columns.tolist() == [
         "frame_index",
-        "track_1_mean_intensity",
-        "track_1_area",
-        "track_2_mean_intensity",
-        "track_2_area",
+        "object_1_mean_intensity",
+        "object_1_area",
+        "object_2_mean_intensity",
+        "object_2_area",
     ]
-    assert wide["track_1_mean_intensity"].iloc[:2].tolist() == [10.0, 11.0]
-    assert pd.isna(wide["track_1_mean_intensity"].iloc[2])
-    assert wide["track_2_area"].iloc[[0, 2]].tolist() == [200.0, 202.0]
-    assert pd.isna(wide["track_2_area"].iloc[1])
+    assert wide["object_1_mean_intensity"].iloc[:2].tolist() == [10.0, 11.0]
+    assert pd.isna(wide["object_1_mean_intensity"].iloc[2])
+    assert wide["object_2_area"].iloc[[0, 2]].tolist() == [200.0, 202.0]
+    assert pd.isna(wide["object_2_area"].iloc[1])
 
 
 def test_reshape_tracking_timeseries_auto_exports_measured_channel_columns():
@@ -47,10 +50,56 @@ def test_reshape_tracking_timeseries_auto_exports_measured_channel_columns():
 
     assert wide.columns.tolist() == [
         "frame_index",
-        "track_1_mean_intensity_ch1",
-        "track_1_mean_intensity_ch3",
-        "track_1_area",
+        "object_1_mean_intensity_ch1",
+        "object_1_mean_intensity_ch3",
+        "object_1_area",
     ]
+
+
+def test_tracking_timeseries_tables_keeps_time_down_rows_and_objects_grouped():
+    df = pd.DataFrame(
+        {
+            "filename": ["movie.nd2::P0_T0", "movie.nd2::P0_T0", "movie.nd2::P0_T1"],
+            "frame_index": [0, 0, 1],
+            "track_id": [1, 2, 1],
+            "mean_intensity_ch1": [10.0, 20.0, 11.0],
+            "mean_intensity_ch2": [100.0, 200.0, 101.0],
+            "area": [50, 60, 51],
+        }
+    )
+
+    tables = tracking_timeseries_tables(df, intensity_columns="auto")
+
+    assert len(tables) == 1
+    _, wide = tables[0]
+    assert wide.columns.tolist() == [
+        "frame_index",
+        "object_1_mean_intensity_ch1",
+        "object_1_mean_intensity_ch2",
+        "object_1_area",
+        "object_2_mean_intensity_ch1",
+        "object_2_mean_intensity_ch2",
+        "object_2_area",
+    ]
+    assert wide["frame_index"].tolist() == [0, 1]
+
+
+def test_object_tracking_visualization_uses_editable_track_ids():
+    plugin = ObjectTrackingPlugin()
+    image = np.zeros((32, 32), dtype=float)
+    masks0 = image.astype("int32")
+    masks0[5:9, 5:9] = 1
+    masks1 = image.astype("int32")
+    masks1[14:18, 14:18] = 1
+    masks1[20:24, 20:24] = 2
+
+    viz0 = plugin.visualize(image, masks0, filename="movie.tif::T0")
+    viz1 = plugin.visualize(image, masks1, filename="movie.tif::T1")
+
+    assert int(viz0.max()) == 1
+    assert set(int(v) for v in pd.unique(pd.Series(viz1.ravel())) if int(v) > 0) == {1, 2}
+    assert int(viz1[11, 11]) == 1
+    assert np.count_nonzero(viz1[masks1 == 1]) < np.count_nonzero(masks1 == 1)
 
 
 def test_export_tracking_timeseries_writes_one_file_per_position_series(tmp_path):
@@ -78,5 +127,5 @@ def test_export_tracking_timeseries_writes_one_file_per_position_series(tmp_path
     ]
     p0 = pd.read_csv(tmp_path / "movie_P0_object_tracking_timeseries.csv")
     p1 = pd.read_csv(tmp_path / "movie_P1_object_tracking_timeseries.csv")
-    assert p0["track_1_area"].tolist() == [100, 101]
-    assert p1["track_1_mean_intensity"].tolist() == [30.0, 31.0]
+    assert p0["object_1_area"].tolist() == [100, 101]
+    assert p1["object_1_mean_intensity"].tolist() == [30.0, 31.0]

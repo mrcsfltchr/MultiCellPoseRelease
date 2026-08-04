@@ -1182,6 +1182,7 @@ class ImageService:
         plugin_name=None,
         reference_masks=None,
         require_same_label=False,
+        allow_labels_above_reference=False,
     ):
         if not filename:
             return None
@@ -1200,6 +1201,7 @@ class ImageService:
                 masks,
                 reference_masks,
                 require_same_label=require_same_label,
+                allow_labels_above_reference=allow_labels_above_reference,
             ):
                 _logger.warning(
                     "Ignoring stale visualization mask %s: it does not match current masks.",
@@ -1212,7 +1214,12 @@ class ImageService:
             return None
 
 
-def _visualization_matches_reference(viz_masks, reference_masks, require_same_label=False) -> bool:
+def _visualization_matches_reference(
+    viz_masks,
+    reference_masks,
+    require_same_label=False,
+    allow_labels_above_reference=False,
+) -> bool:
     viz = np.squeeze(np.asarray(viz_masks))
     ref = np.squeeze(np.asarray(reference_masks))
     if viz.shape != ref.shape:
@@ -1221,7 +1228,7 @@ def _visualization_matches_reference(viz_masks, reference_masks, require_same_la
         return True
     if not np.issubdtype(viz.dtype, np.integer):
         return False
-    if int(viz.max()) > int(ref.max()):
+    if not allow_labels_above_reference and int(viz.max()) > int(ref.max()):
         return False
     if require_same_label:
         nonzero = viz > 0

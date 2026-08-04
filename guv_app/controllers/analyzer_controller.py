@@ -25,6 +25,7 @@ class AnalyzerController(MainController):
         self.pending_series_file = None
         self.pending_visualization_generation = False
         self.visualization_masks_by_file = {}
+        self.rejected_object_tracking_track_ids = set()
         # Analyzer prefers predictions
         self.mask_load_priority = ['_pred.npy', '_seg.npy']
 
@@ -162,6 +163,7 @@ class AnalyzerController(MainController):
             )
             self.model.view_config.show_visualization = True
             self.view.control_panel.visualization_checkbox.setChecked(True)
+            self._prepare_plugin_review_display(plugin)
             if hasattr(self.view, "set_plugin_hint_visible"):
                 self.view.set_plugin_hint_visible(True)
             self.view.show_progress(
@@ -215,9 +217,19 @@ class AnalyzerController(MainController):
         ref = self.image_service.build_image_reference(self.model.filename or "", self.model.frame_id)
         normalized = os.path.normcase(os.path.normpath(ref))
         if normalized in self.visualization_masks_by_file:
-            self.model.set_visualization(self.visualization_masks_by_file[normalized])
+            viz_mask, changed = self._apply_rejected_tracks_to_visualization(self.visualization_masks_by_file[normalized])
+            if changed:
+                self.visualization_masks_by_file[normalized] = viz_mask
+                self.image_service.save_visualization_mask(
+                    self.model.filename,
+                    self.model.frame_id,
+                    viz_mask,
+                    plugin_name=self.active_plugin.name if self.active_plugin else None,
+                )
+            self.model.set_visualization(viz_mask)
             self.model.view_config.show_visualization = True
             self.view.control_panel.visualization_checkbox.setChecked(True)
+            self._prepare_plugin_review_display(self.active_plugin)
             return
 
         plugin_name = self.active_plugin.name if self.active_plugin else None
@@ -227,33 +239,157 @@ class AnalyzerController(MainController):
             plugin_name=plugin_name,
             reference_masks=self.model.masks,
             require_same_label=plugin_name == "Condensate Droplet Analysis",
+            allow_labels_above_reference=plugin_name == "Object Tracking",
         )
         if stored is not None:
+            stored, changed = self._apply_rejected_tracks_to_visualization(stored)
             self.model.set_visualization(stored)
             self.visualization_masks_by_file[normalized] = np.array(stored, copy=True)
+            if changed:
+                self.image_service.save_visualization_mask(
+                    self.model.filename,
+                    self.model.frame_id,
+                    stored,
+                    plugin_name=plugin_name,
+                )
             self.model.view_config.show_visualization = True
             self.view.control_panel.visualization_checkbox.setChecked(True)
+            self._prepare_plugin_review_display(self.active_plugin)
             return
 
+        viz_params = dict(self.active_plugin_params or {})
+        frame_name = os.path.basename(self.model.filename) if self.model.filename else None
+        if frame_name and self.model.frame_id:
+            frame_name = f"{frame_name}::{self.model.frame_id}"
+        if frame_name:
+            viz_params.setdefault("filename", frame_name)
         viz_mask = self.analysis_service.run_visualization(
             self.active_plugin,
             self.model.image_data,
             self.model.masks,
             classes=self.model.classes,
-            plugin_params=self.active_plugin_params,
+            plugin_params=viz_params,
         )
         if viz_mask is None:
             return
+        viz_mask, _ = self._apply_rejected_tracks_to_visualization(viz_mask)
         self.model.set_visualization(viz_mask)
         self._store_visualization_for_current_file()
         self.model.view_config.show_visualization = True
         self.view.control_panel.visualization_checkbox.setChecked(True)
+        self._prepare_plugin_review_display(self.active_plugin)
 
     def _plugin_supports_visualization(self, plugin):
         try:
             return plugin.visualize.__func__ is not AnalysisPlugin.visualize
         except AttributeError:
             return False
+
+    def _prepare_plugin_review_display(self, plugin):
+        if plugin is None or plugin.name != "Object Tracking":
+            if hasattr(self.model, "set_visualization_color_by_label"):
+                self.model.set_visualization_color_by_label(False)
+            return
+        if hasattr(self.model, "set_visualization_color_by_label"):
+            self.model.set_visualization_color_by_label(True)
+        self.model.view_config.color_by_class = False
+        checkbox = getattr(getattr(self.view, "control_panel", None), "color_by_class_checkbox", None)
+        if checkbox is not None and checkbox.isChecked():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+        self.model.trigger_view_update()
+
+    def _is_object_tracking_review_active(self):
+        return (
+            self.active_plugin is not None
+            and self.active_plugin.name == "Object Tracking"
+            and self.pending_series_file is not None
+            and self.model.visualization_masks is not None
+            and self.model.view_config.show_visualization
+        )
+
+    def _track_ids_at_point(self, y, x):
+        if not hasattr(self.model, "visualization_label_at_point"):
+            return set()
+        track_id = int(self.model.visualization_label_at_point(int(y), int(x)))
+        return {track_id} if track_id > 0 else set()
+
+    def _track_ids_in_polygon(self, points):
+        if not hasattr(self.model, "visualization_labels_in_polygon"):
+            return set()
+        return self.model.visualization_labels_in_polygon(points)
+
+    def _remove_track_ids_from_review(self, track_ids):
+        track_ids = {int(i) for i in track_ids if int(i) > 0}
+        if not track_ids or not self.pending_series_file:
+            return 0
+        self.rejected_object_tracking_track_ids.update(track_ids)
+        frames = self.image_service.iter_image_frames(
+            self.pending_series_file,
+            series_index=self.pending_series_index,
+        )
+        changed = 0
+        for frame in frames:
+            ref = self.image_service.build_image_reference(self.pending_series_file, frame.frame_id)
+            normalized = os.path.normcase(os.path.normpath(ref))
+            viz = self.visualization_masks_by_file.get(normalized)
+            if viz is None:
+                viz = self.image_service.load_visualization_mask(
+                    self.pending_series_file,
+                    frame.frame_id,
+                    plugin_name="Object Tracking",
+                    allow_labels_above_reference=True,
+                )
+            if viz is None:
+                continue
+            updated = np.array(viz, copy=True)
+            nonzero_before = int(np.count_nonzero(updated))
+            updated[np.isin(updated, list(track_ids))] = 0
+            if int(np.count_nonzero(updated)) == nonzero_before:
+                continue
+            changed += 1
+            self.visualization_masks_by_file[normalized] = updated
+            self.image_service.save_visualization_mask(
+                self.pending_series_file,
+                frame.frame_id,
+                updated,
+                plugin_name="Object Tracking",
+            )
+            if self.model.filename == self.pending_series_file and self.model.frame_id == frame.frame_id:
+                self.model.set_visualization(updated)
+        return changed
+
+    def _apply_rejected_tracks_to_visualization(self, viz):
+        if self.active_plugin is None or self.active_plugin.name != "Object Tracking":
+            return viz, False
+        rejected = {int(i) for i in getattr(self, "rejected_object_tracking_track_ids", set()) if int(i) > 0}
+        if not rejected or viz is None:
+            return viz, False
+        updated = np.array(viz, copy=True)
+        before = int(np.count_nonzero(updated))
+        updated[np.isin(updated, list(rejected))] = 0
+        return updated, int(np.count_nonzero(updated)) != before
+
+    def _approved_track_ids_for_series(self, base_file, frames):
+        approved = set()
+        for frame in frames:
+            ref = self.image_service.build_image_reference(base_file, frame.frame_id)
+            normalized = os.path.normcase(os.path.normpath(ref))
+            viz = self.visualization_masks_by_file.get(normalized)
+            if viz is None:
+                viz = self.image_service.load_visualization_mask(
+                    base_file,
+                    frame.frame_id,
+                    plugin_name="Object Tracking",
+                    allow_labels_above_reference=True,
+                )
+            if viz is None:
+                continue
+            viz, _ = self._apply_rejected_tracks_to_visualization(viz)
+            ids = np.unique(np.asarray(viz))
+            approved.update(int(i) for i in ids if int(i) > 0)
+        return sorted(approved)
 
     def _get_analysis_image(self):
         """Return the pre-normalization image for intensity measurements.
@@ -370,9 +506,15 @@ class AnalyzerController(MainController):
 
         # 3. Run Visualization
         try:
+            viz_params = dict(params)
+            frame_name = os.path.basename(self.model.filename) if self.model.filename else None
+            if frame_name and self.model.frame_id:
+                frame_name = f"{frame_name}::{self.model.frame_id}"
+            if frame_name:
+                viz_params.setdefault("filename", frame_name)
             viz_mask = self.analysis_service.run_visualization(
                 plugin, analysis_image, self.model.masks,
-                classes=self.model.classes, plugin_params=params
+                classes=self.model.classes, plugin_params=viz_params
             )
             
             if viz_mask is not None:
@@ -381,6 +523,7 @@ class AnalyzerController(MainController):
                 self.model.set_visualization(viz_mask)
                 self.model.view_config.show_visualization = True
                 self.view.control_panel.visualization_checkbox.setChecked(True)
+                self._prepare_plugin_review_display(plugin)
                 if hasattr(self.view, "set_plugin_hint_visible"):
                     self.view.set_plugin_hint_visible(True)
                 self.view.show_progress(f"Visualization applied. Edit masks or reload image to restore original view.")
@@ -416,9 +559,12 @@ class AnalyzerController(MainController):
             except Exception:
                 pass
         plugin = selected_plugins[0]
+        plugin_params = self._augment_plugin_params_for_current_model(plugin_params, [plugin])
         if self._plugin_supports_visualization(plugin):
             self.active_plugin = plugin
             self.active_plugin_params = plugin_params.get(plugin.name, {})
+            if plugin.name == "Object Tracking":
+                self.rejected_object_tracking_track_ids = set()
             self.pending_series_file = base_file
             self.pending_series_index = series_index
             self.pending_folder_path = None
@@ -436,6 +582,7 @@ class AnalyzerController(MainController):
             )
             self.model.view_config.show_visualization = True
             self.view.control_panel.visualization_checkbox.setChecked(True)
+            self._prepare_plugin_review_display(plugin)
             if hasattr(self.view, "set_plugin_hint_visible"):
                 self.view.set_plugin_hint_visible(True)
             self.view.show_progress(
@@ -470,10 +617,17 @@ class AnalyzerController(MainController):
             series_index = self.pending_series_index
             selected_plugins = [plugin]
             plugin_params = {plugin.name: dict(self.active_plugin_params or {})}
+            self._store_visualization_for_current_file()
             frames = self.image_service.iter_image_frames(base_file, series_index=series_index)
             if not frames:
                 self.view.show_progress("No frames found for this series.")
                 return
+            if plugin.name == "Object Tracking":
+                approved_track_ids = self._approved_track_ids_for_series(base_file, frames)
+                if not approved_track_ids:
+                    self.view.show_progress("No approved Object Tracking tracks remain to save.")
+                    return
+                plugin_params[plugin.name]["approved_track_ids"] = approved_track_ids
             combined = {}
             for frame in frames:
                 image = self.image_service.load_frame(base_file, frame.frame_id)
@@ -506,9 +660,12 @@ class AnalyzerController(MainController):
                     plugin_name=plugin.name,
                     reference_masks=masks,
                     require_same_label=plugin.name == "Condensate Droplet Analysis",
+                    allow_labels_above_reference=plugin.name == "Object Tracking",
                 )
                 if viz_mask is not None:
                     plugin_params[plugin.name]["visualization_masks"] = viz_mask
+                else:
+                    plugin_params[plugin.name].pop("visualization_masks", None)
                 frame_name = os.path.basename(base_file)
                 if frame.frame_id:
                     frame_name = f"{frame_name}::{frame.frame_id}"
@@ -556,14 +713,36 @@ class AnalyzerController(MainController):
                         channel_suffix = "_multi_channel"
                 out_path = f"{os.path.splitext(base_file)[0]}__series{series_suffix}_{safe_name}{channel_suffix}.csv"
                 try:
-                    merged.to_csv(out_path, index=False)
-                    self.view.show_progress(f"Saved {os.path.basename(out_path)}")
+                    if plugin_name == "Object Tracking":
+                        from guv_app.plugins.object_tracking_timeseries_export import tracking_timeseries_tables
+                        tables = tracking_timeseries_tables(
+                            merged,
+                            fallback_name=f"{os.path.basename(os.path.splitext(base_file)[0])}_{safe_name}",
+                            intensity_columns="auto",
+                        )
+                        saved = []
+                        if len(tables) == 1:
+                            tables[0][1].to_csv(out_path, index=False)
+                            saved.append(out_path)
+                        else:
+                            root = os.path.splitext(base_file)[0]
+                            for series_key, wide_df in tables:
+                                label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip()).strip("._") or "series"
+                                path = f"{root}__series{series_suffix}_{safe_name}__{label}.csv"
+                                wide_df.to_csv(path, index=False)
+                                saved.append(path)
+                        for path in saved:
+                            self.view.show_progress(f"Saved {os.path.basename(path)}")
+                    else:
+                        merged.to_csv(out_path, index=False)
+                        self.view.show_progress(f"Saved {os.path.basename(out_path)}")
                 except Exception as exc:
                     self.view.show_progress(f"Failed to save {safe_name} CSV: {exc}")
             if hasattr(self.view, "set_plugin_hint_visible"):
                 self.view.set_plugin_hint_visible(False)
             self.pending_series_file = None
             self.pending_series_index = None
+            self.rejected_object_tracking_track_ids = set()
             return
         if self.pending_folder_path:
             if self.active_plugin is None:
@@ -702,7 +881,30 @@ class AnalyzerController(MainController):
         super().handle_add_mask_from_stroke(points)
 
     def handle_delete_mask(self, y, x):
+        if self._is_object_tracking_review_active():
+            track_ids = self._track_ids_at_point(y, x)
+            changed = self._remove_track_ids_from_review(track_ids)
+            if changed:
+                label = ", ".join(str(i) for i in sorted(track_ids))
+                self.view.statusBar().showMessage(f"Removed track {label} from {changed} frame(s).")
+            elif not track_ids:
+                self.view.statusBar().showMessage("No track selected in visualization.")
+            return
         super().handle_delete_mask(y, x)
+        if (self.pending_folder_path or self.pending_series_file) and self.model.visualization_masks is not None:
+            self._store_visualization_for_current_file()
+
+    def handle_delete_masks_lasso(self, points):
+        if self._is_object_tracking_review_active():
+            track_ids = self._track_ids_in_polygon(points)
+            changed = self._remove_track_ids_from_review(track_ids)
+            if changed:
+                label = ", ".join(str(i) for i in sorted(track_ids))
+                self.view.statusBar().showMessage(f"Removed tracks {label} from {changed} frame(s).")
+            elif not track_ids:
+                self.view.statusBar().showMessage("No tracks selected in visualization.")
+            return
+        super().handle_delete_masks_lasso(points)
         if (self.pending_folder_path or self.pending_series_file) and self.model.visualization_masks is not None:
             self._store_visualization_for_current_file()
 
@@ -721,3 +923,17 @@ def _align_image_to_masks(image, masks):
     if img.ndim >= 2 and tuple(img.shape[-2:]) == tuple(mask_shape):
         return image
     return None
+
+
+def _to_2d_array(value):
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        return arr[0]
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        return arr[..., 0]
+    squeezed = np.squeeze(arr)
+    return squeezed if squeezed.ndim == 2 else None

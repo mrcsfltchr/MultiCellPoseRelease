@@ -54,6 +54,7 @@ class ApplicationStateModel(QObject):
         self.view_config = ViewConfig()
         self.cellpix = None # np.ndarray for mask instances
         self.visualization_masks = None # Temporary masks for visualization (not saved)
+        self.visualization_color_by_label = False
         self.outpix = None  # np.ndarray for outlines
         self.ncells = 0
         self.strokes = []
@@ -149,6 +150,7 @@ class ApplicationStateModel(QObject):
         # Reset mask data
         self.cellpix = np.zeros((self.NZ, self.Ly, self.Lx), dtype=np.uint16)
         self.visualization_masks = None
+        self.visualization_color_by_label = False
         self.outpix = np.zeros((self.NZ, self.Ly, self.Lx), dtype=np.uint16)
         self.ncells = 0
         self.strokes = []
@@ -169,6 +171,10 @@ class ApplicationStateModel(QObject):
     def set_visualization(self, masks):
         """Sets a temporary visualization mask that overrides the display."""
         self.visualization_masks = masks
+        self.trigger_view_update()
+
+    def set_visualization_color_by_label(self, enabled):
+        self.visualization_color_by_label = bool(enabled)
         self.trigger_view_update()
 
     def add_mask(self, points):
@@ -208,6 +214,7 @@ class ApplicationStateModel(QObject):
             self.generate_instance_colors(self.ncells + 1 - len(self.instance_colors))
 
         self.visualization_masks = None # Clear visualization on edit
+        self.visualization_color_by_label = False
         self.trigger_view_update()
 
     def add_masks(self, masks, classes=None):
@@ -288,6 +295,7 @@ class ApplicationStateModel(QObject):
                 self.mask_classes[new_mask_id] = 1
 
         self.visualization_masks = None # Clear visualization on load
+        self.visualization_color_by_label = False
         self.trigger_view_update()
         return True
 
@@ -863,6 +871,7 @@ class ApplicationStateModel(QObject):
             self.current_class -= 1
 
         self.visualization_masks = None
+        self.visualization_color_by_label = False
         self.trigger_view_update()
 
 
@@ -935,6 +944,28 @@ class ApplicationStateModel(QObject):
                     self.visualization_masks = masks
                 self.trigger_view_update()
 
+    def visualization_label_at_point(self, y, x):
+        """Returns the visualization label at a point without mutating the mask."""
+        masks = self.visualization_masks
+        if masks is None:
+            return 0
+        if masks.ndim == 3:
+            masks = masks[0]
+        if 0 <= y < masks.shape[0] and 0 <= x < masks.shape[1]:
+            return int(masks[y, x])
+        return 0
+
+    def visualization_labels_in_polygon(self, points):
+        """Returns nonzero visualization labels inside a polygon without mutating the mask."""
+        if self.visualization_masks is None or cv2 is None or not points:
+            return set()
+        masks = self.visualization_masks[0] if self.visualization_masks.ndim == 3 else self.visualization_masks
+        poly = self._polygon_mask(points, masks.shape)
+        if poly is None:
+            return set()
+        ids = np.unique(masks[poly])
+        return {int(i) for i in ids if int(i) > 0}
+
     def _polygon_mask(self, points, shape):
         if cv2 is None:
             return None
@@ -963,6 +994,7 @@ class ApplicationStateModel(QObject):
         self.selected_mask_ids = set()
         self.selected_reference_mask_id = None
         self.visualization_masks = None
+        self.visualization_color_by_label = False
         self.trigger_view_update()
         return int(ids.size)
 
@@ -1016,6 +1048,7 @@ class ApplicationStateModel(QObject):
             self.cellpix = merged
         self.outpix = utils.masks_to_outlines(self.cellpix) * self.cellpix
         self.visualization_masks = None
+        self.visualization_color_by_label = False
         self.trigger_view_update()
         return True, f"Moved {selected_ids.size} mask(s)."
 
@@ -1206,42 +1239,44 @@ class ApplicationStateModel(QObject):
         pred_path = f"{base}{frame_suffix}_pred.npy"
         channel_index = result.channel_index if result.channel_index is not None else 0
 
-        # Build a proper channel state entry for this result (with visible colors).
-        # Prefer the live channel state (updated by persist_current_channel_state) because
-        # it carries the correct mask_classes (class 1 for unlabeled) and instance_colors
-        # that are already on screen.  Fall back to building from the result if the live
-        # state is missing or has a different mask set.
-        live_state = self.channel_segmentations.get(channel_index)
         masks = result.masks
         n = int(masks.max()) if masks.size else 0
         masks_3d = masks[np.newaxis, ...] if masks.ndim == 2 else np.array(masks, copy=True)
-        _live_masks = live_state.get("masks") if live_state else None
-        _live_n = int(np.asarray(_live_masks).max()) if _live_masks is not None else -1
-        if live_state is not None and _live_n == n:
-            # Use the live channel state — it has class 1 labels and visible colors.
-            this_channel_state = {k: (np.array(v, copy=True) if isinstance(v, np.ndarray) else v)
-                                   for k, v in live_state.items()}
+
+        live_state = self.channel_segmentations.get(channel_index)
+        is_current_frame_result = (
+            result.filename == self.filename
+            and (result.frame_id is None or result.frame_id == self.frame_id)
+            and channel_index == self.get_current_channel_index()
+        )
+        live_masks = live_state.get("masks") if live_state else None
+        live_shape = tuple(np.asarray(live_masks).shape) if live_masks is not None else None
+
+        if is_current_frame_result and live_state is not None and live_shape == tuple(masks_3d.shape):
+            this_channel_state = {
+                k: (np.array(v, copy=True) if isinstance(v, np.ndarray) else v)
+                for k, v in live_state.items()
+            }
+            outpix_for_file = this_channel_state.get("outpix")
+            classes_for_file = this_channel_state.get("mask_classes", result.classes)
         else:
-            outpix = utils.masks_to_outlines(masks_3d) * masks_3d
+            outpix_for_file = utils.masks_to_outlines(masks_3d) * masks_3d
             classes = result.classes if result.classes is not None else None
             if classes is None or not np.any(np.asarray(classes)[1:n + 1] > 0):
-                # Default unlabeled masks to class 1 (same as add_masks behaviour).
-                mc = np.ones(n + 1, dtype=np.int16)
-                mc[0] = 0
+                mask_classes = np.ones(n + 1, dtype=np.int16)
+                mask_classes[0] = 0
             else:
-                mc = np.asarray(classes, dtype=np.int16)
-            instance_colors = np.random.randint(0, 255, (n + 1, 3), dtype=np.uint8)
+                mask_classes = np.asarray(classes, dtype=np.int16)
+            classes_for_file = mask_classes
             this_channel_state = {
                 "masks": masks_3d,
-                "outpix": outpix,
-                "mask_classes": mc,
-                "instance_colors": instance_colors,
+                "outpix": outpix_for_file,
+                "mask_classes": mask_classes,
+                "instance_colors": np.random.randint(0, 255, (n + 1, 3), dtype=np.uint8),
                 "pred_classes_map": result.classes_map,
                 "flows": result.flows or [],
             }
 
-        # Load other channels' data from the existing file on disk so that running
-        # inference a second time on a different channel doesn't erase the first.
         channel_segs = {}
         try:
             if os.path.exists(pred_path):
@@ -1253,8 +1288,8 @@ class ApplicationStateModel(QObject):
                     except (ValueError, TypeError):
                         pass
         except Exception:
-            pass  # If the file is unreadable, start fresh — no data loss beyond what was there
-        # When frozen, merge new result on top of the existing channel state on disk.
+            pass
+
         if self.view_config.masks_frozen and channel_index in channel_segs:
             existing_state = channel_segs[channel_index]
             if existing_state.get("masks") is not None:
@@ -1262,19 +1297,16 @@ class ApplicationStateModel(QObject):
         channel_segs[channel_index] = this_channel_state
 
         ismanual = np.zeros(n, bool)
-        # outpix/classes may not be defined if the live_state branch was taken above;
-        # fall back to result fields so the dat dict is always valid.
-        _outpix = locals().get("outpix")
-        _classes = locals().get("classes", result.classes)
         dat = {
-            "outlines": result.outlines if result.outlines is not None else _outpix,
+            "outlines": result.outlines if result.outlines is not None else outpix_for_file,
             "masks": result.masks,
             "chan_choose": [0, 0],
             "ismanual": ismanual,
             "filename": result.filename,
+            "frame_id": result.frame_id,
             "flows": result.flows,
             "diameter": result.diameter,
-            "classes": _classes,
+            "classes": classes_for_file,
             "classes_map": result.classes_map,
             "class_names": result.class_names,
             "class_colors": result.class_colors,

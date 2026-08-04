@@ -153,8 +153,12 @@ class StatisticsWorker(BaseWorker):
                                         plugin_name=name,
                                         reference_masks=masks,
                                         require_same_label=name == "Condensate Droplet Analysis",
+                                        allow_labels_above_reference=name == "Object Tracking",
                                     )
                                 if viz_mask is None and self._plugin_supports_visualization(plugin):
+                                    if name not in plugin_params:
+                                        plugin_params[name] = {}
+                                    plugin_params[name].setdefault("filename", frame_label)
                                     viz_mask = self.analysis_service.run_visualization(
                                         plugin,
                                         image,
@@ -175,6 +179,7 @@ class StatisticsWorker(BaseWorker):
                             for plugin in self.plugins or []:
                                 try:
                                     params = (plugin_params or {}).get(plugin.name, {})
+                                    params.setdefault("filename", frame_label)
                                     viz_mask = self.analysis_service.run_visualization(
                                         plugin,
                                         image,
@@ -245,14 +250,24 @@ class StatisticsWorker(BaseWorker):
                     safe_name = "".join(
                         x for x in plugin_name if x.isalnum() or x in "._- "
                     ).replace(" ", "_")
-                    if self.output_path_prefix is not None:
-                        channel_suffix = _channel_suffix_from_df(final_df)
-                        save_path = f"{self.output_path_prefix}{safe_name}{channel_suffix}.csv"
-                    else:
-                        save_path = os.path.join(
+                    if plugin_name == "Object Tracking":
+                        saved_paths = _save_object_tracking_timeseries_results(
+                            final_df,
+                            safe_name,
                             self.folder_path,
-                            f"statistics_results__{safe_name}{series_suffix}.csv",
+                            series_suffix,
+                            self.output_path_prefix,
                         )
+                        for path in saved_paths:
+                            self.progress.emit(f"Saved results to {os.path.basename(path)}")
+                        continue
+                    save_path = _analysis_save_path(
+                        final_df,
+                        safe_name,
+                        self.folder_path,
+                        series_suffix,
+                        self.output_path_prefix,
+                    )
                     final_df.to_csv(save_path, index=False)
                     self.progress.emit(f"Saved results to {os.path.basename(save_path)}")
             else:
@@ -281,6 +296,42 @@ def _channel_suffix_from_df(df):
         if val:
             return f"_{val}"
     return "_multi_channel" if values else ""
+
+
+def _analysis_save_path(df, safe_name, folder_path, series_suffix, output_path_prefix):
+    if output_path_prefix is not None:
+        channel_suffix = _channel_suffix_from_df(df)
+        return f"{output_path_prefix}{safe_name}{channel_suffix}.csv"
+    return os.path.join(
+        folder_path,
+        f"statistics_results__{safe_name}{series_suffix}.csv",
+    )
+
+
+def _save_object_tracking_timeseries_results(final_df, safe_name, folder_path, series_suffix, output_path_prefix):
+    from guv_app.plugins.object_tracking_timeseries_export import tracking_timeseries_tables
+
+    fallback_name = f"statistics_results__{safe_name}{series_suffix}"
+    tables = tracking_timeseries_tables(final_df, fallback_name=fallback_name, intensity_columns="auto")
+    if len(tables) == 1:
+        save_path = _analysis_save_path(final_df, safe_name, folder_path, series_suffix, output_path_prefix)
+        tables[0][1].to_csv(save_path, index=False)
+        return [save_path]
+
+    saved_paths = []
+    for series_key, wide_df in tables:
+        series_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip())
+        series_label = series_label.strip("._") or "series"
+        if output_path_prefix is not None:
+            save_path = f"{output_path_prefix}{safe_name}__{series_label}.csv"
+        else:
+            save_path = os.path.join(
+                folder_path,
+                f"statistics_results__{safe_name}__{series_label}.csv",
+            )
+        wide_df.to_csv(save_path, index=False)
+        saved_paths.append(save_path)
+    return saved_paths
 
 
 def _align_image_to_masks(image, masks):

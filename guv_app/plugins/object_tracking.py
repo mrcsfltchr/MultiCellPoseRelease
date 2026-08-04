@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 
 from guv_app.plugins.interface import AnalysisPlugin
+from guv_app.plugins.validator import validate_visualization_mask
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 _logger = logging.getLogger(__name__)
 
@@ -52,6 +57,7 @@ class ObjectTrackingPlugin(AnalysisPlugin):
         self._sequence_key = None
         self._next_track_id = 1
         self._tracks: Dict[int, _TrackState] = {}
+        self._track_history: Dict[int, List[Tuple[int, float, float]]] = {}
         self._last_frame_index = -1
 
     def get_parameter_definitions(self):
@@ -133,6 +139,19 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 "max": 100000000,
                 "label": "Minimum Area (px)",
             },
+            "show_track_history": {
+                "type": "bool",
+                "default": True,
+                "label": "Show Track History",
+                "help": "Draw each approved track history in the editable visualization overlay.",
+            },
+            "trail_length_frames": {
+                "type": "int",
+                "default": 30,
+                "min": 1,
+                "max": 10000,
+                "label": "Trail Length (frames)",
+            },
         }
 
     def run(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> pd.DataFrame:
@@ -171,7 +190,35 @@ class ObjectTrackingPlugin(AnalysisPlugin):
         )
         rows = self._assign_tracks(detections, **kwargs)
         self._last_frame_index = frame_index
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        return _filter_approved_tracks(df, kwargs.get("approved_track_ids"))
+
+    def visualize(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> np.ndarray:
+        if masks is None:
+            return None
+        masks2d = _to_2d_masks(np.asarray(masks))
+        if masks2d is None or int(masks2d.max()) <= 0:
+            return None
+        df = self.run(image, masks, classes=classes, **kwargs)
+        out = np.zeros_like(masks2d, dtype=np.int32)
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                track_id = int(row["track_id"])
+                if bool(kwargs.get("show_track_history", True)):
+                    _draw_track_history_label(
+                        out,
+                        self._track_history.get(track_id, []),
+                        track_id,
+                        trail_length=int(kwargs.get("trail_length_frames", 30)),
+                    )
+                _draw_current_track_marker(
+                    out,
+                    float(row["centroid_y"]),
+                    float(row["centroid_x"]),
+                    track_id,
+                )
+        validate_visualization_mask(out, masks2d, allow_new_labels=True)
+        return out
 
     def _run_stack(self, image: np.ndarray, masks: np.ndarray, classes: np.ndarray = None, **kwargs) -> pd.DataFrame:
         self._reset_state()
@@ -197,12 +244,14 @@ class ObjectTrackingPlugin(AnalysisPlugin):
             )
             rows.extend(self._assign_tracks(detections, **kwargs))
             self._last_frame_index = frame_index
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        return _filter_approved_tracks(df, kwargs.get("approved_track_ids"))
 
     def _reset_state(self) -> None:
         self._sequence_key = None
         self._next_track_id = 1
         self._tracks = {}
+        self._track_history = {}
         self._last_frame_index = -1
 
     def _assign_tracks(self, detections: List[_Detection], **kwargs) -> List[dict]:
@@ -256,6 +305,9 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 last_frame_index=det.frame_index,
                 age=age,
             )
+            self._track_history.setdefault(track_id, []).append(
+                (int(det.frame_index), float(det.centroid_y), float(det.centroid_x))
+            )
             rows.append(_row_from_detection(det, track_id, status, age, cost, dist, gap))
         return rows
 
@@ -263,6 +315,68 @@ class ObjectTrackingPlugin(AnalysisPlugin):
 def _is_mask_stack(masks: np.ndarray) -> bool:
     arr = np.asarray(masks)
     return arr.ndim == 3 and arr.shape[0] > 1 and arr.shape[1] > 1 and arr.shape[2] > 1
+
+
+def _filter_approved_tracks(df: pd.DataFrame, approved_track_ids) -> pd.DataFrame:
+    if df is None or df.empty or approved_track_ids is None:
+        return df
+    ids = _parse_track_id_set(approved_track_ids)
+    if not ids:
+        return df.iloc[0:0].copy()
+    return df[df["track_id"].astype(int).isin(ids)].copy()
+
+
+def _draw_track_history_label(out: np.ndarray, history, track_id: int, trail_length: int = 30) -> None:
+    if cv2 is None or not history:
+        return
+    ordered = sorted(history, key=lambda item: int(item[0]))
+    if trail_length > 0:
+        ordered = ordered[-trail_length:]
+    if len(ordered) == 1:
+        _, y, x = ordered[0]
+        cv2.circle(out, (int(round(x)), int(round(y))), 2, int(track_id), -1, lineType=cv2.LINE_8)
+        return
+    points = [(int(round(x)), int(round(y))) for _, y, x in ordered]
+    for p0, p1 in zip(points[:-1], points[1:]):
+        cv2.line(out, p0, p1, int(track_id), 2, lineType=cv2.LINE_8)
+    cv2.circle(out, points[-1], 2, int(track_id), -1, lineType=cv2.LINE_8)
+
+
+def _draw_current_track_marker(out: np.ndarray, y: float, x: float, track_id: int) -> None:
+    if cv2 is None:
+        yy = int(round(y))
+        xx = int(round(x))
+        if 0 <= yy < out.shape[0] and 0 <= xx < out.shape[1]:
+            out[yy, xx] = int(track_id)
+        return
+    center = (int(round(x)), int(round(y)))
+    cv2.line(out, (center[0] - 3, center[1]), (center[0] + 3, center[1]), int(track_id), 1, lineType=cv2.LINE_8)
+    cv2.line(out, (center[0], center[1] - 3), (center[0], center[1] + 3), int(track_id), 1, lineType=cv2.LINE_8)
+
+
+def _parse_track_id_set(value) -> set:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return set()
+        out = set()
+        for token in re.split(r"[,; ]+", text):
+            if not token:
+                continue
+            try:
+                out.add(int(token))
+            except Exception:
+                pass
+        return out
+    try:
+        return {int(v) for v in value}
+    except TypeError:
+        try:
+            return {int(value)}
+        except Exception:
+            return set()
 
 
 def _to_2d_masks(masks: np.ndarray) -> Optional[np.ndarray]:

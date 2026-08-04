@@ -102,21 +102,27 @@ class BaseMainView(QMainWindow):
 
         # Image Item
         self.img_item = pg.ImageItem()
+        self.img_item.setZValue(0)
         self.view_box.addItem(self.img_item)
 
         # Drawing Item (Masks)
         self.drawing_item = DrawingItem(parent=self)
+        self.drawing_item.setZValue(10)
         self.view_box.addItem(self.drawing_item)
 
         self.association_lines_item = pg.PlotDataItem()
+        self.association_lines_item.setZValue(20)
         self.association_lines_item.setPen(pg.mkPen((0, 255, 0), width=2))
         self.view_box.addItem(self.association_lines_item)
         self.association_selected_lines_item = pg.PlotDataItem()
+        self.association_selected_lines_item.setZValue(21)
         self.association_selected_lines_item.setPen(pg.mkPen((0, 255, 255), width=3))
         self.view_box.addItem(self.association_selected_lines_item)
         self.association_points_item = pg.ScatterPlotItem(size=6, pxMode=True, pen=None, brush=pg.mkBrush(0, 255, 0, 220))
+        self.association_points_item.setZValue(22)
         self.view_box.addItem(self.association_points_item)
         self.association_selected_points_item = pg.ScatterPlotItem(size=8, pxMode=True, pen=None, brush=pg.mkBrush(0, 255, 255, 240))
+        self.association_selected_points_item.setZValue(23)
         self.view_box.addItem(self.association_selected_points_item)
         self.reference_selection_points_item = pg.ScatterPlotItem(
             size=14,
@@ -125,7 +131,15 @@ class BaseMainView(QMainWindow):
             pen=pg.mkPen((0, 255, 255), width=3),
             brush=None,
         )
+        self.reference_selection_points_item.setZValue(24)
         self.view_box.addItem(self.reference_selection_points_item)
+        self.review_track_lines_item = pg.ImageItem()
+        self.review_track_lines_item.setZValue(30)
+        self.view_box.addItem(self.review_track_lines_item)
+        self.review_track_points_item = pg.ScatterPlotItem(size=8, pxMode=True)
+        self.review_track_points_item.setZValue(31)
+        self.view_box.addItem(self.review_track_points_item)
+        self.review_track_label_items = []
 
         self.main_layout.addWidget(self.graph_layout, stretch=3)
 
@@ -564,11 +578,14 @@ class BaseMainView(QMainWindow):
 
         if self.model.image_data is None:
             self._clear_association_overlay()
+            self._clear_review_track_overlay()
             return
 
         h, w = self.model.image_data.shape[:2]
         mask_display = np.zeros((h, w, 4), dtype=np.uint8)
         z = 0
+        pending_review_viz_masks = None
+        pending_review_object_masks = None
 
         reference_idx = getattr(self.model, "previous_channel_index", None)
         current_idx = self.model.get_current_channel_index() if hasattr(self.model, "get_current_channel_index") else 0
@@ -591,6 +608,7 @@ class BaseMainView(QMainWindow):
             self._blit_rgba(mask_display, ref_rgba)
 
         has_viz = self.model.visualization_masks is not None and self.model.view_config.show_visualization
+        label_review_viz = has_viz and bool(getattr(self.model, "visualization_color_by_label", False))
         if (self.model.cellpix is not None or has_viz) and (
             self.model.view_config.masks_visible
             or self.model.view_config.outlines_visible
@@ -598,21 +616,30 @@ class BaseMainView(QMainWindow):
         ):
             source_masks = None
             is_outline_mode = False
+            viz_masks = None
             if has_viz:
                 if self.model.visualization_masks.ndim == 3:
                     if z < self.model.visualization_masks.shape[0]:
-                        source_masks = self.model.visualization_masks[z]
+                        viz_masks = self.model.visualization_masks[z]
                 else:
-                    source_masks = self.model.visualization_masks
-            else:
-                if self.model.cellpix is not None:
+                    viz_masks = self.model.visualization_masks
+            if label_review_viz:
+                if self.model.cellpix is not None and self.model.view_config.masks_visible:
                     source_masks = self.model.cellpix[z]
-                if not self.model.view_config.masks_visible and self.model.view_config.outlines_visible:
+                elif self.model.cellpix is not None and self.model.view_config.outlines_visible:
                     if self.model.outpix is not None:
                         source_masks = self.model.outpix[z]
                         is_outline_mode = True
-                elif not self.model.view_config.masks_visible:
-                    source_masks = None
+            elif has_viz:
+                source_masks = viz_masks
+            elif self.model.cellpix is not None:
+                source_masks = self.model.cellpix[z]
+            if not has_viz and not self.model.view_config.masks_visible and self.model.view_config.outlines_visible:
+                if self.model.outpix is not None:
+                    source_masks = self.model.outpix[z]
+                    is_outline_mode = True
+            elif not has_viz and not self.model.view_config.masks_visible:
+                source_masks = None
 
             if source_masks is not None and source_masks.max() > 0:
                 current_state = self.model.get_channel_state(current_idx) if hasattr(self.model, "get_channel_state") else {
@@ -627,6 +654,11 @@ class BaseMainView(QMainWindow):
                     selection_color=np.array([255, 255, 255], dtype=np.uint8),
                 )
                 self._blit_rgba(mask_display, current_rgba)
+            if label_review_viz and viz_masks is not None:
+                pending_review_viz_masks = viz_masks
+                pending_review_object_masks = self.model.cellpix[z] if self.model.cellpix is not None else None
+            else:
+                self._clear_review_track_overlay()
 
         # Redraw the selected previous-channel mask on top so it remains visible
         # even when the current-channel masks overlap it.
@@ -665,6 +697,8 @@ class BaseMainView(QMainWindow):
 
         self.drawing_item.setImage(mask_display, autoLevels=False)
         self.drawing_item.setLevels([0, 255])
+        if pending_review_viz_masks is not None:
+            self._update_review_track_overlay(pending_review_viz_masks, pending_review_object_masks)
 
     def _clear_association_overlay(self):
         for item in (
@@ -680,6 +714,98 @@ class BaseMainView(QMainWindow):
                 item.setData([], [])
             except TypeError:
                 item.setData(x=[], y=[])
+
+    def _clear_review_track_overlay(self):
+        if getattr(self, "review_track_lines_item", None) is not None:
+            self.review_track_lines_item.clear()
+        if getattr(self, "review_track_points_item", None) is not None:
+            try:
+                self.review_track_points_item.setData([])
+            except TypeError:
+                self.review_track_points_item.setData(x=[], y=[])
+        for item in getattr(self, "review_track_label_items", []):
+            try:
+                self.view_box.removeItem(item)
+            except Exception:
+                pass
+        self.review_track_label_items = []
+
+    def _update_review_track_overlay(self, viz_masks, object_masks):
+        self.drawing_item.setZValue(10)
+        self.review_track_lines_item.setZValue(40)
+        self.review_track_points_item.setZValue(41)
+        viz = np.asarray(viz_masks)
+        if viz.ndim != 2 or viz.max() <= 0:
+            self._clear_review_track_overlay()
+            return
+        obj = np.asarray(object_masks) if object_masks is not None else np.zeros_like(viz)
+        if obj.shape != viz.shape:
+            obj = np.zeros_like(viz)
+
+        rgba = np.zeros(viz.shape + (4,), dtype=np.uint8)
+        current = (viz > 0) & (obj > 0)
+        track_pixels = viz > 0
+        for label in np.unique(viz[track_pixels]):
+            label = int(label)
+            if label <= 0:
+                continue
+            color = np.asarray(_review_track_color(label), dtype=np.uint8)
+            label_pixels = track_pixels & (viz == label)
+            current_pixels = current & (viz == label)
+            if np.any(current_pixels):
+                cy, cx = np.mean(np.nonzero(current_pixels), axis=1)
+            else:
+                cy, cx = np.mean(np.nonzero(label_pixels), axis=1)
+            yy, xx = np.nonzero(label_pixels)
+            dist = np.hypot(yy.astype(float) - float(cy), xx.astype(float) - float(cx))
+            if dist.size and float(dist.max()) > 0:
+                recency = 1.0 - (dist / float(dist.max()))
+            else:
+                recency = np.ones_like(dist, dtype=float)
+            alpha = (70 + 185 * recency).astype(np.uint8)
+            rgb = (color[None, :] * (0.65 + 0.35 * recency[:, None]) + 255 * (0.35 * (1.0 - recency[:, None]))).astype(np.uint8)
+            rgba[yy, xx, :3] = rgb
+            rgba[yy, xx, 3] = alpha
+        self.review_track_lines_item.setImage(rgba, autoLevels=False)
+        self.review_track_lines_item.setLevels([0, 255])
+
+        spots = []
+        for item in getattr(self, "review_track_label_items", []):
+            try:
+                self.view_box.removeItem(item)
+            except Exception:
+                pass
+        self.review_track_label_items = []
+
+        for label in np.unique(viz[current]):
+            label = int(label)
+            if label <= 0:
+                continue
+            yy, xx = np.nonzero(current & (viz == label))
+            if yy.size == 0:
+                continue
+            y = float(np.mean(yy))
+            x = float(np.mean(xx))
+            color = _review_track_color(label)
+            spots.append(
+                {
+                    "pos": (x, y),
+                    "brush": pg.mkBrush(*color, 230),
+                    "pen": pg.mkPen((255, 255, 255), width=1),
+                    "size": 8,
+                }
+            )
+            text = pg.TextItem(
+                text=str(label),
+                color=color,
+                anchor=(0, 1),
+                fill=pg.mkBrush(0, 0, 0, 150),
+            )
+            text.setPos(x + 5, y - 5)
+            text.setZValue(42)
+            self.view_box.addItem(text)
+            self.review_track_label_items.append(text)
+        self.review_track_points_item.setData(spots)
 
     def _update_association_overlay(self, segments):
         if not segments:
@@ -724,7 +850,7 @@ class BaseMainView(QMainWindow):
         mask = overlay[:, :, 3] > 0
         base[mask] = overlay[mask]
 
-    def _render_mask_layer(self, source_masks, state, alpha_val, force_color=None, selected_ids=None, selection_color=None):
+    def _render_mask_layer(self, source_masks, state, alpha_val, force_color=None, selected_ids=None, selection_color=None, color_by_label=False):
         if source_masks is None or source_masks.max() <= 0:
             return None
         max_id = int(source_masks.max())
@@ -734,7 +860,7 @@ class BaseMainView(QMainWindow):
             color_lut[1:] = np.asarray(force_color, dtype=np.uint8)
             vis_lut = np.ones(max_id + 1, dtype=bool)
             vis_lut[0] = False
-        elif self.model.view_config.color_by_class:
+        elif self.model.view_config.color_by_class and not color_by_label:
             mask_classes = np.asarray(state.get("mask_classes"), dtype=np.int16)
             if len(mask_classes) <= max_id:
                 mask_classes = np.pad(mask_classes, (0, max_id - len(mask_classes) + 1))
@@ -776,3 +902,17 @@ class BaseMainView(QMainWindow):
 
     def display_image(self, image_data):
         self.img_item.setImage(image_data, autoLevels=False, levels=(0, 255))
+
+
+def _review_track_color(track_id):
+    palette = [
+        (0, 180, 216),
+        (255, 183, 3),
+        (42, 157, 143),
+        (231, 111, 81),
+        (131, 118, 184),
+        (239, 71, 111),
+        (6, 214, 160),
+        (255, 127, 80),
+    ]
+    return palette[(int(track_id) - 1) % len(palette)]

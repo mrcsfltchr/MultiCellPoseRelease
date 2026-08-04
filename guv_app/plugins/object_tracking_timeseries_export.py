@@ -15,6 +15,7 @@ def export_tracking_timeseries_csvs(
     intensity_column: str = "mean_intensity",
     intensity_columns=None,
     area_column: str = "area",
+    object_prefix: str = "object",
     overwrite: bool = False,
 ) -> List[str]:
     """
@@ -36,13 +37,14 @@ def export_tracking_timeseries_csvs(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     written = []
-    for series_key, series_df in _iter_timeseries(df, fallback_name=input_path.stem):
-        wide = reshape_tracking_timeseries(
-            series_df,
-            intensity_column=intensity_column,
-            intensity_columns=resolved_intensity_columns,
-            area_column=area_column,
-        )
+    for series_key, wide in tracking_timeseries_tables(
+        df,
+        fallback_name=input_path.stem,
+        intensity_column=intensity_column,
+        intensity_columns=resolved_intensity_columns,
+        area_column=area_column,
+        object_prefix=object_prefix,
+    ):
         out_path = out_dir / f"{_safe_filename(series_key)}_object_tracking_timeseries.csv"
         if out_path.exists() and not overwrite:
             raise FileExistsError(f"{out_path} already exists; pass --overwrite to replace it")
@@ -56,6 +58,7 @@ def reshape_tracking_timeseries(
     intensity_column: str = "mean_intensity",
     intensity_columns=None,
     area_column: str = "area",
+    object_prefix: str = "object",
 ) -> pd.DataFrame:
     resolved_intensity_columns = _resolve_intensity_columns(
         df,
@@ -69,12 +72,41 @@ def reshape_tracking_timeseries(
     for track_id in track_ids:
         track_df = df[df["track_id"].astype(int) == track_id]
         area_by_frame = _series_by_frame(track_df, area_column)
-        title = f"track_{track_id}"
+        title = f"{object_prefix}_{track_id}"
         for column in resolved_intensity_columns:
             intensity_by_frame = _series_by_frame(track_df, column)
             wide[f"{title}_{column}"] = wide["frame_index"].map(intensity_by_frame)
         wide[f"{title}_{area_column}"] = wide["frame_index"].map(area_by_frame)
     return wide
+
+
+def tracking_timeseries_tables(
+    df: pd.DataFrame,
+    fallback_name: str = "object_tracking",
+    intensity_column: str = "mean_intensity",
+    intensity_columns=None,
+    area_column: str = "area",
+    object_prefix: str = "object",
+) -> List[Tuple[str, pd.DataFrame]]:
+    resolved_intensity_columns = _resolve_intensity_columns(
+        df,
+        intensity_column=intensity_column,
+        intensity_columns=intensity_columns,
+    )
+    _validate_tracking_table(df, intensity_columns=resolved_intensity_columns, area_column=area_column)
+    return [
+        (
+            series_key,
+            reshape_tracking_timeseries(
+                series_df,
+                intensity_column=intensity_column,
+                intensity_columns=resolved_intensity_columns,
+                area_column=area_column,
+                object_prefix=object_prefix,
+            ),
+        )
+        for series_key, series_df in _iter_timeseries(df, fallback_name=fallback_name)
+    ]
 
 
 def _validate_tracking_table(
@@ -192,6 +224,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="area",
         help="Tracking output column to use for area values.",
     )
+    parser.add_argument(
+        "--object-prefix",
+        default="object",
+        help="Prefix for each object ID column group.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output CSVs.")
     args = parser.parse_args(argv)
 
@@ -201,6 +238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         intensity_column=args.intensity_column,
         intensity_columns=args.intensity_columns,
         area_column=args.area_column,
+        object_prefix=args.object_prefix,
         overwrite=args.overwrite,
     )
     for path in written:

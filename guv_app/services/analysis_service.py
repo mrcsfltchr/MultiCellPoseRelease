@@ -201,14 +201,17 @@ class AnalysisService:
             if df is not None and not df.empty:
                 # Sanitize plugin name for filename
                 safe_name = "".join(x for x in plugin_name if x.isalnum() or x in "._- ").replace(" ", "_")
-                suffix = _csv_suffix_from_df(df)
-                csv_path = f"{base}{frame_suffix}_{safe_name}{suffix}.csv"
                 try:
+                    if plugin_name == "Object Tracking":
+                        saved_files.extend(_save_object_tracking_results(df, base, frame_suffix, safe_name))
+                        continue
+                    suffix = _csv_suffix_from_df(df)
+                    csv_path = f"{base}{frame_suffix}_{safe_name}{suffix}.csv"
                     df.to_csv(csv_path, index=False)
                     saved_files.append(csv_path)
                     _logger.info(f"Saved analysis results to {csv_path}")
                 except Exception as e:
-                    _logger.error(f"Failed to save CSV {csv_path}: {e}")
+                    _logger.error(f"Failed to save CSV for {plugin_name}: {e}")
         return saved_files
 
 
@@ -231,3 +234,26 @@ def _csv_suffix_from_df(df: pd.DataFrame) -> str:
         if val:
             return f"_{val}"
     return "_multi_channel"
+
+
+def _save_object_tracking_results(df: pd.DataFrame, base: str, frame_suffix: str, safe_name: str) -> List[str]:
+    from guv_app.plugins.object_tracking_timeseries_export import tracking_timeseries_tables
+
+    fallback_name = f"{os.path.basename(base)}{frame_suffix}_{safe_name}"
+    tables = tracking_timeseries_tables(df, fallback_name=fallback_name, intensity_columns="auto")
+    saved_files = []
+    if len(tables) == 1:
+        csv_path = f"{base}{frame_suffix}_{safe_name}.csv"
+        tables[0][1].to_csv(csv_path, index=False)
+        saved_files.append(csv_path)
+        _logger.info(f"Saved analysis results to {csv_path}")
+        return saved_files
+
+    for series_key, wide_df in tables:
+        series_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip())
+        series_label = series_label.strip("._") or "series"
+        csv_path = f"{base}{frame_suffix}_{safe_name}__{series_label}.csv"
+        wide_df.to_csv(csv_path, index=False)
+        saved_files.append(csv_path)
+        _logger.info(f"Saved analysis results to {csv_path}")
+    return saved_files
