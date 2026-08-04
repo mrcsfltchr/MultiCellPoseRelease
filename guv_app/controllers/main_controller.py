@@ -303,6 +303,15 @@ class MainController(QObject):
     def _on_image_loaded(self, image_data, filename, frame_id, frame_refs):
         self.view.set_progress_busy(False)
         self._cleanup_load_thread()
+        previous_filename = self.model.filename
+        preserve_frame_view_state = (
+            previous_filename is not None
+            and os.path.normcase(os.path.normpath(previous_filename))
+            == os.path.normcase(os.path.normpath(filename))
+            and self.model.frame_id != frame_id
+        )
+        preserved_channel_index = int(getattr(self.model.view_config, "channel_index", 0))
+        preserved_levels = self._capture_level_slider_values() if preserve_frame_view_state else None
         self.model.previous_channel_index = None
         self.model.clear_reference_selection()
         if hasattr(self.view, "set_association_mode_enabled"):
@@ -384,6 +393,14 @@ class MainController(QObject):
             self.model.current_z_index = 0
         self.model.z_count = self.image_service.get_z_info(filename, frame_id=frame_id)
         self.model.update_image(normalized_data, filename, source_image=source_image)
+        if preserve_frame_view_state and self.model.raw_image is not None:
+            if self.model.raw_image.ndim == 3 and self.model.raw_image.shape[2] > 1:
+                self.model.view_config.channel_index = min(
+                    preserved_channel_index,
+                    self.model.raw_image.shape[2] - 1,
+                )
+            else:
+                self.model.view_config.channel_index = 0
         self.model.frame_refs = frame_refs if use_frame_refs else []
         if hasattr(self.view, "control_panel"):
             self.view.control_panel.run_series_button.setEnabled(bool(self.model.frame_refs))
@@ -402,9 +419,9 @@ class MainController(QObject):
                 self.view.statusBar().showMessage(
                     f"Z: {self.model.current_z_index + 1}/{self.model.z_count}  (Q/E to navigate)"
                 )
-        self.init_sliders(normalized_data)
+        self.init_sliders(normalized_data, preserved_values=preserved_levels)
         self.refresh_class_list()
-        self.handle_level_change(0, 0)
+        self._apply_display_modes()
         self._autoload_masks(filename)
 
     @staticmethod
@@ -536,21 +553,10 @@ class MainController(QObject):
                                 self.model.class_names = list(dat['class_names'])
                             if 'class_colors' in dat and dat['class_colors'] is not None:
                                 self.model.class_colors = np.asarray(dat['class_colors'], dtype=np.uint8)
-                            current_ch = self.model.get_current_channel_index()
-                            current_state = (
-                                channel_segmentations.get(str(current_ch))
-                                or channel_segmentations.get(current_ch)
-                            )
-                            current_ch_has_masks = (
-                                isinstance(current_state, dict)
-                                and current_state.get("masks") is not None
-                                and int(np.asarray(current_state["masks"]).max()) > 0
-                            )
-                            switch_ch = not current_ch_has_masks
                             self.model.load_channel_segmentations(
                                 channel_segmentations,
                                 active_channel_index=active_channel_index,
-                                switch_channel=switch_ch,
+                                switch_channel=False,
                             )
                             self.model.load_associations(associations)
                             success = True
@@ -613,7 +619,18 @@ class MainController(QObject):
                         0, 255, (n + 1, 3), dtype=np.uint8
                     )
 
-    def init_sliders(self, image):
+    def _capture_level_slider_values(self):
+        if not hasattr(self.view.control_panel, "sliders"):
+            return None
+        values = []
+        for slider in self.view.control_panel.sliders:
+            try:
+                values.append(tuple(slider.value()))
+            except Exception:
+                values.append(None)
+        return values
+
+    def init_sliders(self, image, preserved_values=None):
         """Initializes slider ranges based on the loaded image."""
         if not hasattr(self.view.control_panel, 'sliders'):
             return
@@ -657,6 +674,16 @@ class MainController(QObject):
             
         for slider in self.view.control_panel.sliders:
             slider.blockSignals(False)
+
+        if preserved_values:
+            for slider, value in zip(self.view.control_panel.sliders, preserved_values):
+                if value is None or not slider.isEnabled():
+                    continue
+                try:
+                    slider.blockSignals(True)
+                    slider.setValue(value)
+                finally:
+                    slider.blockSignals(False)
 
     def handle_level_change(self, channel_idx, value):
         """Updates the image display based on slider values."""
