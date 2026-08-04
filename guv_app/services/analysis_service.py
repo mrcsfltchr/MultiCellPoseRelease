@@ -237,16 +237,21 @@ def _csv_suffix_from_df(df: pd.DataFrame) -> str:
 
 
 def _save_object_tracking_results(df: pd.DataFrame, base: str, frame_suffix: str, safe_name: str) -> List[str]:
-    from guv_app.plugins.object_tracking_timeseries_export import tracking_timeseries_tables
+    from guv_app.plugins.object_tracking_timeseries_export import tracking_position_tables, tracking_timeseries_tables
 
     fallback_name = f"{os.path.basename(base)}{frame_suffix}_{safe_name}"
     tables = tracking_timeseries_tables(df, fallback_name=fallback_name, intensity_columns="auto")
+    position_tables = tracking_position_tables(df, fallback_name=fallback_name)
     saved_files = []
     if len(tables) == 1:
         csv_path = f"{base}{frame_suffix}_{safe_name}.csv"
         tables[0][1].to_csv(csv_path, index=False)
         saved_files.append(csv_path)
         _logger.info(f"Saved analysis results to {csv_path}")
+        pos_path = f"{base}{frame_suffix}_{safe_name}_positions.csv"
+        position_tables[0][1].to_csv(pos_path, index=False)
+        saved_files.append(pos_path)
+        _logger.info(f"Saved analysis results to {pos_path}")
         return saved_files
 
     for series_key, wide_df in tables:
@@ -254,6 +259,13 @@ def _save_object_tracking_results(df: pd.DataFrame, base: str, frame_suffix: str
         series_label = series_label.strip("._") or "series"
         csv_path = f"{base}{frame_suffix}_{safe_name}__{series_label}.csv"
         wide_df.to_csv(csv_path, index=False)
+        saved_files.append(csv_path)
+        _logger.info(f"Saved analysis results to {csv_path}")
+    for series_key, position_df in position_tables:
+        series_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip())
+        series_label = series_label.strip("._") or "series"
+        csv_path = f"{base}{frame_suffix}_{safe_name}__{series_label}_positions.csv"
+        position_df.to_csv(csv_path, index=False)
         saved_files.append(csv_path)
         _logger.info(f"Saved analysis results to {csv_path}")
     return saved_files

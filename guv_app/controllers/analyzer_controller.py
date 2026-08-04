@@ -714,22 +714,35 @@ class AnalyzerController(MainController):
                 out_path = f"{os.path.splitext(base_file)[0]}__series{series_suffix}_{safe_name}{channel_suffix}.csv"
                 try:
                     if plugin_name == "Object Tracking":
-                        from guv_app.plugins.object_tracking_timeseries_export import tracking_timeseries_tables
+                        from guv_app.plugins.object_tracking_timeseries_export import tracking_position_tables, tracking_timeseries_tables
+                        fallback_name = f"{os.path.basename(os.path.splitext(base_file)[0])}_{safe_name}"
                         tables = tracking_timeseries_tables(
                             merged,
-                            fallback_name=f"{os.path.basename(os.path.splitext(base_file)[0])}_{safe_name}",
+                            fallback_name=fallback_name,
                             intensity_columns="auto",
+                        )
+                        position_tables = tracking_position_tables(
+                            merged,
+                            fallback_name=fallback_name,
                         )
                         saved = []
                         if len(tables) == 1:
                             tables[0][1].to_csv(out_path, index=False)
                             saved.append(out_path)
+                            pos_path = f"{os.path.splitext(out_path)[0]}_positions.csv"
+                            position_tables[0][1].to_csv(pos_path, index=False)
+                            saved.append(pos_path)
                         else:
                             root = os.path.splitext(base_file)[0]
                             for series_key, wide_df in tables:
                                 label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip()).strip("._") or "series"
                                 path = f"{root}__series{series_suffix}_{safe_name}__{label}.csv"
                                 wide_df.to_csv(path, index=False)
+                                saved.append(path)
+                            for series_key, position_df in position_tables:
+                                label = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(series_key).strip()).strip("._") or "series"
+                                path = f"{root}__series{series_suffix}_{safe_name}__{label}_positions.csv"
+                                position_df.to_csv(path, index=False)
                                 saved.append(path)
                         for path in saved:
                             self.view.show_progress(f"Saved {os.path.basename(path)}")

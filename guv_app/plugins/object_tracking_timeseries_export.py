@@ -50,6 +50,16 @@ def export_tracking_timeseries_csvs(
             raise FileExistsError(f"{out_path} already exists; pass --overwrite to replace it")
         wide.to_csv(out_path, index=False)
         written.append(str(out_path))
+    for series_key, positions in tracking_position_tables(
+        df,
+        fallback_name=input_path.stem,
+        object_prefix=object_prefix,
+    ):
+        out_path = out_dir / f"{_safe_filename(series_key)}_object_tracking_positions.csv"
+        if out_path.exists() and not overwrite:
+            raise FileExistsError(f"{out_path} already exists; pass --overwrite to replace it")
+        positions.to_csv(out_path, index=False)
+        written.append(str(out_path))
     return written
 
 
@@ -109,6 +119,40 @@ def tracking_timeseries_tables(
     ]
 
 
+def reshape_tracking_positions(
+    df: pd.DataFrame,
+    object_prefix: str = "object",
+) -> pd.DataFrame:
+    _validate_position_table(df)
+    track_ids = sorted(df["track_id"].dropna().astype(int).unique())
+    frames = sorted(df["frame_index"].dropna().astype(int).unique())
+    wide = pd.DataFrame({"frame_index": frames})
+
+    for track_id in track_ids:
+        track_df = df[df["track_id"].astype(int) == track_id]
+        title = f"{object_prefix}_{track_id}"
+        x_by_frame = _series_by_frame(track_df, "centroid_x")
+        y_by_frame = _series_by_frame(track_df, "centroid_y")
+        wide[f"{title}_x"] = wide["frame_index"].map(x_by_frame)
+        wide[f"{title}_y"] = wide["frame_index"].map(y_by_frame)
+    return wide
+
+
+def tracking_position_tables(
+    df: pd.DataFrame,
+    fallback_name: str = "object_tracking",
+    object_prefix: str = "object",
+) -> List[Tuple[str, pd.DataFrame]]:
+    _validate_position_table(df)
+    return [
+        (
+            series_key,
+            reshape_tracking_positions(series_df, object_prefix=object_prefix),
+        )
+        for series_key, series_df in _iter_timeseries(df, fallback_name=fallback_name)
+    ]
+
+
 def _validate_tracking_table(
     df: pd.DataFrame,
     intensity_columns=None,
@@ -124,6 +168,16 @@ def _validate_tracking_table(
         )
 
 
+def _validate_position_table(df: pd.DataFrame) -> None:
+    required = {"frame_index", "track_id", "centroid_x", "centroid_y"}
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(
+            "Input CSV does not look like Object Tracking output. "
+            f"Missing position columns: {', '.join(missing)}"
+        )
+
+
 def _resolve_intensity_columns(
     df: pd.DataFrame,
     intensity_column: str = "mean_intensity",
@@ -134,13 +188,28 @@ def _resolve_intensity_columns(
     if isinstance(intensity_columns, str):
         text = intensity_columns.strip()
         if not text or text.lower() == "auto":
-            measured = sorted(
-                [col for col in df.columns if re.fullmatch(r"mean_intensity_ch\d+", str(col))],
-                key=lambda col: int(re.search(r"\d+", str(col)).group(0)),
-            )
+            measured = _auto_tracking_value_columns(df)
             return measured or [intensity_column]
         return [part.strip() for part in re.split(r"[,; ]+", text) if part.strip()]
     return [str(col).strip() for col in intensity_columns if str(col).strip()]
+
+
+def _auto_tracking_value_columns(df: pd.DataFrame) -> List[str]:
+    channel_columns = []
+    patterns = [
+        (r"mean_intensity_ch(\d+)", 0),
+        (r"background_intensity_ch(\d+)", 1),
+        (r"mean_intensity_bg_subtracted_ch(\d+)", 2),
+    ]
+    for col in df.columns:
+        text = str(col)
+        for pattern, order in patterns:
+            match = re.fullmatch(pattern, text)
+            if match:
+                channel_columns.append((int(match.group(1)), order, text))
+                break
+    channel_columns.sort(key=lambda item: (item[0], item[1]))
+    return [column for _, _, column in channel_columns]
 
 
 def _iter_timeseries(df: pd.DataFrame, fallback_name: str) -> Iterable[Tuple[str, pd.DataFrame]]:

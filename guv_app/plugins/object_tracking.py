@@ -8,6 +8,7 @@ import pandas as pd
 
 from guv_app.plugins.interface import AnalysisPlugin
 from guv_app.plugins.validator import validate_visualization_mask
+from guv_app.plugins.basic_stats import _local_background_values, _make_local_background_labels
 try:
     import cv2
 except ImportError:
@@ -25,8 +26,13 @@ class _Detection:
     centroid_y: float
     centroid_x: float
     tracking_intensity: float
+    tracking_background_intensity: float
+    tracking_intensity_bg_subtracted: float
     mean_intensity: float
+    mean_intensity_bg_subtracted: float
     measurement_intensities: Dict[str, float]
+    measurement_background_intensities: Dict[str, float]
+    measurement_bg_subtracted_intensities: Dict[str, float]
     perimeter: float
     circularity: float
     aspect_ratio: float
@@ -73,6 +79,36 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 "default": "all",
                 "label": "Measurement Channels",
                 "help": "Channels measured for each final track. Use 'all' or comma-separated one-based channels, e.g. 1,2.",
+            },
+            "local_background_subtraction": {
+                "type": "bool",
+                "default": True,
+                "label": "Local Background",
+                "help": "Measure a local background annulus for each object and save background-subtracted intensities.",
+            },
+            "background_inner_gap_px": {
+                "type": "int",
+                "default": 2,
+                "min": 0,
+                "max": 50,
+                "label": "Background Gap (px)",
+                "help": "Pixels to skip between each mask and its local background annulus.",
+            },
+            "background_outer_radius_px": {
+                "type": "int",
+                "default": 12,
+                "min": 1,
+                "max": 200,
+                "label": "Background Radius (px)",
+                "help": "Outer radius of each local background annulus.",
+            },
+            "background_percentile": {
+                "type": "float",
+                "default": 25.0,
+                "min": 0.0,
+                "max": 100.0,
+                "label": "Background Percentile",
+                "help": "Robust percentile used as the local background level.",
             },
             "max_displacement_px": {
                 "type": "float",
@@ -187,6 +223,10 @@ class ObjectTrackingPlugin(AnalysisPlugin):
             classes=classes,
             frame_index=frame_index,
             min_area=max(1, int(kwargs.get("min_area_px", 1))),
+            local_background_subtraction=bool(kwargs.get("local_background_subtraction", True)),
+            background_inner_gap_px=max(0, int(kwargs.get("background_inner_gap_px", 2))),
+            background_outer_radius_px=max(1, int(kwargs.get("background_outer_radius_px", 12))),
+            background_percentile=float(kwargs.get("background_percentile", 25.0)),
         )
         rows = self._assign_tracks(detections, **kwargs)
         self._last_frame_index = frame_index
@@ -241,6 +281,10 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 classes=frame_classes,
                 frame_index=frame_index,
                 min_area=max(1, int(kwargs.get("min_area_px", 1))),
+                local_background_subtraction=bool(kwargs.get("local_background_subtraction", True)),
+                background_inner_gap_px=max(0, int(kwargs.get("background_inner_gap_px", 2))),
+                background_outer_radius_px=max(1, int(kwargs.get("background_outer_radius_px", 12))),
+                background_percentile=float(kwargs.get("background_percentile", 25.0)),
             )
             rows.extend(self._assign_tracks(detections, **kwargs))
             self._last_frame_index = frame_index
@@ -532,6 +576,10 @@ def _extract_detections(
     classes: np.ndarray = None,
     frame_index: int = 0,
     min_area: int = 1,
+    local_background_subtraction: bool = True,
+    background_inner_gap_px: int = 2,
+    background_outer_radius_px: int = 12,
+    background_percentile: float = 25.0,
 ) -> List[_Detection]:
     max_label = int(masks2d.max())
     if max_label <= 0:
@@ -549,11 +597,46 @@ def _extract_detections(
         name: np.bincount(flat, weights=np.asarray(image).ravel(), minlength=max_label + 1)
         for name, image in measurement_images.items()
     }
+    mask_ids = np.flatnonzero(area > 0).astype(np.int32)
+    mask_ids = mask_ids[mask_ids > 0]
+    background_percentile = min(100.0, max(0.0, float(background_percentile)))
+    background_inner_gap_px = max(0, int(background_inner_gap_px))
+    background_outer_radius_px = max(1, int(background_outer_radius_px))
+    if background_outer_radius_px <= background_inner_gap_px:
+        background_outer_radius_px = background_inner_gap_px + 1
+
+    tracking_background = np.full(max_label + 1, np.nan, dtype=np.float64)
+    measurement_backgrounds = {
+        name: np.full(max_label + 1, np.nan, dtype=np.float64)
+        for name in measurement_images
+    }
+    if local_background_subtraction and mask_ids.size:
+        bg_labels = _make_local_background_labels(
+            masks2d,
+            background_inner_gap_px,
+            background_outer_radius_px,
+        )
+        if tracking_image is not None:
+            bg_values = _local_background_values(
+                bg_labels,
+                tracking_image,
+                mask_ids,
+                background_percentile,
+            )
+            tracking_background[mask_ids] = bg_values
+        for name, image in measurement_images.items():
+            bg_values = _local_background_values(
+                bg_labels,
+                image,
+                mask_ids,
+                background_percentile,
+            )
+            measurement_backgrounds[name][mask_ids] = bg_values
 
     perimeter = _perimeter_by_label(masks2d, max_label)
     detections = []
-    for mask_id in np.flatnonzero(area > 0):
-        if mask_id == 0 or area[mask_id] < min_area:
+    for mask_id in mask_ids:
+        if area[mask_id] < min_area:
             continue
         region = masks2d == mask_id
         ys, xs = np.nonzero(region)
@@ -565,7 +648,23 @@ def _extract_detections(
             name: float(values[mask_id] / area[mask_id])
             for name, values in measurement_sums.items()
         }
-        measured_mean = float(np.nanmean(list(measured.values()))) if measured else np.nan
+        measured_bg = {
+            _background_column_name(name): float(values[mask_id])
+            for name, values in measurement_backgrounds.items()
+        }
+        measured_bg_sub = {
+            _bg_subtracted_column_name(name): float(measured[name] - measurement_backgrounds[name][mask_id])
+            for name in measured
+        }
+        measured_mean = _finite_mean_or_nan(list(measured.values()))
+        measured_bg_sub_mean = _finite_mean_or_nan(list(measured_bg_sub.values()))
+        tracking_mean = (
+            float(tracking_sum[mask_id] / area[mask_id])
+            if tracking_image is not None
+            else np.nan
+        )
+        tracking_bg = float(tracking_background[mask_id])
+        tracking_bg_sub = float(tracking_mean - tracking_bg)
         detections.append(
             _Detection(
                 frame_index=int(frame_index),
@@ -574,9 +673,14 @@ def _extract_detections(
                 area=float(area[mask_id]),
                 centroid_y=float(sum_y[mask_id] / area[mask_id]),
                 centroid_x=float(sum_x[mask_id] / area[mask_id]),
-                tracking_intensity=float(tracking_sum[mask_id] / area[mask_id]) if tracking_image is not None else np.nan,
+                tracking_intensity=tracking_mean,
+                tracking_background_intensity=tracking_bg,
+                tracking_intensity_bg_subtracted=tracking_bg_sub,
                 mean_intensity=measured_mean,
+                mean_intensity_bg_subtracted=measured_bg_sub_mean,
                 measurement_intensities=measured,
+                measurement_background_intensities=measured_bg,
+                measurement_bg_subtracted_intensities=measured_bg_sub,
                 perimeter=float(perimeter[mask_id]),
                 circularity=circ,
                 aspect_ratio=aspect_ratio,
@@ -606,6 +710,28 @@ def _safe_class(classes: np.ndarray, mask_id: int) -> int:
     return int(arr[mask_id])
 
 
+def _finite_mean_or_nan(values) -> float:
+    if not values:
+        return np.nan
+    arr = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.nan
+    return float(arr[finite].mean())
+
+
+def _background_column_name(mean_column_name: str) -> str:
+    if mean_column_name.startswith("mean_intensity"):
+        return mean_column_name.replace("mean_intensity", "background_intensity", 1)
+    return f"{mean_column_name}_background"
+
+
+def _bg_subtracted_column_name(mean_column_name: str) -> str:
+    if mean_column_name.startswith("mean_intensity"):
+        return mean_column_name.replace("mean_intensity", "mean_intensity_bg_subtracted", 1)
+    return f"{mean_column_name}_bg_subtracted"
+
+
 def _match_cost(det: _Detection, prev: _Detection, gap: int, **kwargs) -> Tuple[float, float]:
     if bool(kwargs.get("class_constraint", True)) and det.class_id > 0 and prev.class_id > 0 and det.class_id != prev.class_id:
         return np.inf, np.inf
@@ -618,7 +744,17 @@ def _match_cost(det: _Detection, prev: _Detection, gap: int, **kwargs) -> Tuple[
 
     dist_cost = distance / max_disp
     area_cost = abs(np.log((det.area + 1.0) / (prev.area + 1.0)))
-    intensity_cost = _relative_difference(det.tracking_intensity, prev.tracking_intensity)
+    det_intensity = (
+        det.tracking_intensity_bg_subtracted
+        if np.isfinite(det.tracking_intensity_bg_subtracted)
+        else det.tracking_intensity
+    )
+    prev_intensity = (
+        prev.tracking_intensity_bg_subtracted
+        if np.isfinite(prev.tracking_intensity_bg_subtracted)
+        else prev.tracking_intensity
+    )
+    intensity_cost = _relative_difference(det_intensity, prev_intensity)
     shape_cost = (
         abs(det.circularity - prev.circularity) +
         abs(np.log((det.aspect_ratio + 1e-6) / (prev.aspect_ratio + 1e-6)))
@@ -654,10 +790,15 @@ def _row_from_detection(det: _Detection, track_id: int, status: str, age: int, c
         "centroid_y": det.centroid_y,
         "centroid_x": det.centroid_x,
         "tracking_mean_intensity": det.tracking_intensity,
+        "tracking_background_intensity": det.tracking_background_intensity,
+        "tracking_mean_intensity_bg_subtracted": det.tracking_intensity_bg_subtracted,
         "mean_intensity": det.mean_intensity,
+        "mean_intensity_bg_subtracted": det.mean_intensity_bg_subtracted,
         "perimeter": det.perimeter,
         "circularity": det.circularity,
         "aspect_ratio": det.aspect_ratio,
     }
     row.update(det.measurement_intensities)
+    row.update(det.measurement_background_intensities)
+    row.update(det.measurement_bg_subtracted_intensities)
     return row

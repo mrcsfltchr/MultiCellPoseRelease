@@ -134,6 +134,50 @@ def test_tracking_channels_and_measurement_channels_are_independent():
     assert float(by_mask.loc[2, "mean_intensity_ch3"]) == 1100.0
 
 
+def test_tracking_reports_local_background_and_subtracted_intensities_by_default():
+    plugin = ObjectTrackingPlugin()
+    image = np.full((32, 32), 2.0, dtype=np.float32)
+    masks = np.zeros((32, 32), dtype=np.int32)
+    masks[12:16, 12:16] = 1
+    image[masks == 1] = 10.0
+
+    df = plugin.run(
+        image,
+        masks,
+        filename="movie.tif::T0",
+        background_inner_gap_px=0,
+        background_outer_radius_px=4,
+        background_percentile=50.0,
+    )
+
+    row = df.iloc[0]
+    assert float(row["tracking_mean_intensity"]) == 10.0
+    assert float(row["tracking_background_intensity"]) == 2.0
+    assert float(row["tracking_mean_intensity_bg_subtracted"]) == 8.0
+    assert float(row["mean_intensity"]) == 10.0
+    assert float(row["mean_intensity_ch1"]) == 10.0
+    assert float(row["background_intensity_ch1"]) == 2.0
+    assert float(row["mean_intensity_bg_subtracted"]) == 8.0
+    assert float(row["mean_intensity_bg_subtracted_ch1"]) == 8.0
+
+
+def test_tracking_can_disable_local_background_measurement():
+    plugin = ObjectTrackingPlugin()
+    image = np.full((32, 32), 2.0, dtype=np.float32)
+    masks = np.zeros((32, 32), dtype=np.int32)
+    masks[12:16, 12:16] = 1
+    image[masks == 1] = 10.0
+
+    df = plugin.run(image, masks, filename="movie.tif::T0", local_background_subtraction=False)
+
+    row = df.iloc[0]
+    assert float(row["tracking_mean_intensity"]) == 10.0
+    assert np.isnan(row["tracking_background_intensity"])
+    assert np.isnan(row["tracking_mean_intensity_bg_subtracted"])
+    assert np.isnan(row["background_intensity_ch1"])
+    assert np.isnan(row["mean_intensity_bg_subtracted_ch1"])
+
+
 def test_position_only_frames_do_not_track_as_timepoints():
     plugin = ObjectTrackingPlugin()
     img0, m0 = _frame([(1, 4, 4, 4, 10.0)])
