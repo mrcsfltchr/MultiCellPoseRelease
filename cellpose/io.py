@@ -531,6 +531,48 @@ class _TiffReader(ImageReader):
 
         return None
 
+    def _metadata_time_axis_override(self, tif, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
+        if not isinstance(axes, str) or "T" in axes or "Z" not in axes:
+            return None
+        if len(shape) != len(axes):
+            return None
+        z_idx = axes.index("Z")
+        if int(shape[z_idx]) <= 1:
+            return None
+
+        try:
+            imagej_meta = getattr(tif, "imagej_metadata", None) or {}
+        except Exception:
+            imagej_meta = {}
+        if not isinstance(imagej_meta, dict):
+            return None
+
+        has_time_metadata = any(
+            key in imagej_meta
+            for key in (
+                "frames",
+                "finterval",
+                "fps",
+                "sampled_frames",
+                "sampled_timestamps_seconds",
+                "sampling_interval_seconds",
+                "slice_interval_seconds",
+            )
+        )
+        if not has_time_metadata:
+            return None
+
+        frames = int(imagej_meta.get("frames", 1) or 1)
+        slices = int(imagej_meta.get("slices", 1) or 1)
+        if frames > 1 and frames != int(shape[z_idx]):
+            return None
+        if frames <= 1 and slices > 1 and not any(
+            key in imagej_meta
+            for key in ("finterval", "fps", "sampled_frames", "sampled_timestamps_seconds", "sampling_interval_seconds")
+        ):
+            return None
+        return axes.replace("Z", "T", 1)
+
     def _normalize_axes(self, tif, series, axes: Optional[str], shape: Tuple[int, ...]) -> Optional[str]:
         if not isinstance(axes, str):
             return None
@@ -542,10 +584,15 @@ class _TiffReader(ImageReader):
             axes = axes.replace("I", "P")
         if self._is_rgb_samples_axis(series, axes, shape):
             # TIFF RGB is often YXS; treat S as channel axis, not series axis.
-            return axes.replace("S", "C")
+            axes = axes.replace("S", "C")
+            time_axes = self._metadata_time_axis_override(tif, axes, shape)
+            return time_axes if time_axes is not None else axes
         axes_override = self._metadata_stack_axis_override(tif, axes, shape)
         if axes_override is not None:
             return axes_override
+        time_axes = self._metadata_time_axis_override(tif, axes, shape)
+        if time_axes is not None:
+            return time_axes
         if (
             axes == "ZYX"
             and len(shape) == 3
@@ -610,14 +657,22 @@ class _TiffReader(ImageReader):
                 arr = series.asarray(key=key_tuple)
             except Exception:
                 arr = series.asarray()[key_tuple]
-            if "C" in axes:
-                c_idx = axes.index("C")
-                if c_idx != arr.ndim - 1:
-                    arr = np.moveaxis(arr, c_idx, -1)
-            arr = _normalize_channels_last(arr)
             new_axes = "".join(
                 [ax for ax, k in zip(axes, key) if not isinstance(k, int)]
             )
+            if "C" in new_axes:
+                c_idx = new_axes.index("C")
+                if c_idx != arr.ndim - 1:
+                    arr = np.moveaxis(arr, c_idx, -1)
+                    new_axes = new_axes[:c_idx] + new_axes[c_idx + 1:] + "C"
+            arr = _normalize_channels_last(arr)
+            if len(new_axes) != arr.ndim:
+                if arr.ndim == 2:
+                    new_axes = "YX"
+                elif arr.ndim == 3 and arr.shape[-1] <= 8:
+                    new_axes = "YXC"
+                else:
+                    new_axes = None
             meta = ImageMeta(
                 axes=new_axes,
                 shape=tuple(arr.shape),

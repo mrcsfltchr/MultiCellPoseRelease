@@ -367,6 +367,32 @@ class ImageService:
                 return np.moveaxis(arr, 1, -1)
         return arr
 
+    def _normalize_channels_last_with_axes(self, arr, axes=None):
+        arr = self._normalize_channels_last(arr)
+        if isinstance(axes, str) and len(axes) == arr.ndim:
+            if "C" in axes:
+                c_idx = axes.index("C")
+                if c_idx != arr.ndim - 1:
+                    arr = np.moveaxis(arr, c_idx, -1)
+                    axes = axes[:c_idx] + axes[c_idx + 1:] + "C"
+            return arr, axes
+        if arr.ndim == 2:
+            return arr, "YX"
+        if arr.ndim == 3 and arr.shape[-1] <= 8 and arr.shape[0] > 8 and arr.shape[1] > 8:
+            return arr, "YXC"
+        return arr, None
+
+    def _frame_meta(self, arr, axes=None, source_meta=None, series_index=None):
+        dtype = getattr(arr, "dtype", getattr(source_meta, "dtype", None))
+        axes = axes if isinstance(axes, str) and len(axes) == arr.ndim else None
+        return io.ImageMeta(
+            axes=axes,
+            shape=tuple(arr.shape),
+            sizes=self._sizes_from_axes(axes, tuple(arr.shape)),
+            dtype=dtype,
+            series_index=series_index,
+        )
+
     def _parse_frame_id(self, frame_id):
         if not frame_id:
             return {}
@@ -500,6 +526,7 @@ class ImageService:
             if arr is None:
                 continue
             meta = base_frame.meta
+            axes = self._axes_from_meta(meta, tuple(arr.shape))
             sizes = getattr(meta, "sizes", None) or {}
             series_key = "S" if sizes.get("S", 1) > 1 else "P" if sizes.get("P", 1) > 1 else None
             axis_series = None
@@ -509,9 +536,11 @@ class ImageService:
                 axis_series = self._axis_index_from_meta(meta, "P", tuple(arr.shape))
             if series_index is not None and axis_series is not None:
                 arr = self._slice_axis(arr, axis_series, series_index)
+                if axes and axis_series < len(axes):
+                    axes = axes[:axis_series] + axes[axis_series + 1:]
                 if not base_id and series_key:
                     base_id = f"{series_key}{series_index}"
-            axis_time = self._axis_index_from_meta(meta, "T", tuple(arr.shape))
+            axis_time = axes.index("T") if axes and "T" in axes else self._axis_index_from_meta(meta, "T", tuple(arr.shape))
             time_count = int(sizes.get("T", 1))
             if time_count <= 1 and hasattr(arr, "shape"):
                 if arr.ndim >= 4 and arr.shape[-1] <= 5:
@@ -522,15 +551,24 @@ class ImageService:
                     if time_index_only is not None and t_index != time_index_only:
                         continue
                     frame_arr = self._slice_axis(arr, axis_time, t_index)
-                    frame_arr = self._normalize_channels_last(frame_arr)
+                    frame_axes = axes[:axis_time] + axes[axis_time + 1:] if axes and axis_time < len(axes) else None
+                    frame_arr, frame_axes = self._normalize_channels_last_with_axes(frame_arr, frame_axes)
                     if base_id and not single_series:
                         frame_id_out = f"{base_id}_T{t_index}"
                     else:
                         frame_id_out = f"T{t_index}"
-                    frames.append(io.ImageFrame(frame_arr, meta, frame_id_out))
+                    frames.append(io.ImageFrame(
+                        frame_arr,
+                        self._frame_meta(frame_arr, frame_axes, meta, series_index=series_index),
+                        frame_id_out,
+                    ))
             else:
-                arr = self._normalize_channels_last(arr)
-                frames.append(io.ImageFrame(arr, meta, base_id))
+                arr, axes = self._normalize_channels_last_with_axes(arr, axes)
+                frames.append(io.ImageFrame(
+                    arr,
+                    self._frame_meta(arr, axes, meta, series_index=series_index),
+                    base_id,
+                ))
         return frames
 
     def _iter_nd2_frames_lazy(self, filename, series_index=None, frame_id=None):
