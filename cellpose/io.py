@@ -460,7 +460,12 @@ def imread(filename, return_first_tile=True, save_tiles=True):
             return None
     else:
         try:
-            dat = np.load(filename, allow_pickle=True).item()
+            loaded = np.load(filename, allow_pickle=True)
+            if isinstance(loaded, np.ndarray) and not (loaded.dtype == object and loaded.shape == ()):
+                return loaded
+            dat = loaded.item()
+            if isinstance(dat, np.ndarray):
+                return dat
             masks = dat["masks"]
             return masks
         except Exception as e:

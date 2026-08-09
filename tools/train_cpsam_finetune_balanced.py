@@ -627,6 +627,48 @@ def valid_class_maps(class_maps: Sequence[np.ndarray | None]) -> list[np.ndarray
     return out
 
 
+def class_probability_row(class_map: np.ndarray | None, nclasses: int) -> np.ndarray | None:
+    if class_map is None:
+        return None
+    try:
+        cmap = np.squeeze(np.asarray(class_map))
+        if cmap.ndim != 2:
+            return None
+        cmap = np.rint(cmap).astype(np.int64, copy=False)
+        if not np.any(cmap > 0):
+            return None
+        counts = np.bincount(cmap.ravel(), minlength=max(1, int(nclasses))).astype(np.float32)
+        counts = counts[1:max(1, int(nclasses))]
+        if counts.size == 0:
+            return None
+        total = float(counts.sum())
+        if total <= 0:
+            return None
+        return counts / total
+    except Exception:
+        return None
+
+
+def compute_class_weights_from_probability_rows(rows: Sequence[np.ndarray], nclasses: int) -> np.ndarray | None:
+    cleaned = [np.asarray(row, dtype=np.float32) for row in rows if row is not None and len(row) > 0]
+    if not cleaned:
+        return None
+    max_len = max(len(row) for row in cleaned)
+    padded = []
+    for row in cleaned:
+        arr = np.zeros(max_len, dtype=np.float32)
+        arr[: len(row)] = row
+        padded.append(arr)
+    pclass = np.mean(np.stack(padded, axis=0), axis=0)
+    pclass[pclass == 0] = 1.0
+    inv = 1.0 / pclass
+    weights = np.ones(max(1, int(nclasses)), dtype=np.float32)
+    fill_len = min(len(inv), max(0, int(nclasses) - 1))
+    if fill_len > 0:
+        weights[1:1 + fill_len] = inv[:fill_len]
+    return weights
+
+
 def load_image_ref(
     image_service: ImageService,
     image: str,
@@ -642,6 +684,122 @@ def load_image_ref(
     if arr is None:
         raise ValueError(f"Could not load image/frame: {image}::{frame_id}")
     return to_channels_last_preserve(np.asarray(arr))
+
+
+def _cache_key(row: dict, view_name: str) -> str:
+    payload = {
+        "image": row.get("image"),
+        "label": row.get("label"),
+        "frame_id": row.get("frame_id") or None,
+        "view": view_name,
+    }
+    text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    return f"{Path(str(row.get('image', 'image'))).stem}_{view_name}_{digest}"
+
+
+def _record_seed(row: dict, seed: int) -> int:
+    payload = {
+        "image": row.get("image"),
+        "label": row.get("label"),
+        "frame_id": row.get("frame_id") or None,
+    }
+    text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return (int(seed) + int(digest, 16)) % (2**31 - 1)
+
+
+def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as handle:
+        np.save(handle, arr)
+    tmp.replace(path)
+
+
+def build_lazy_semantic_cache(
+    records: Sequence[dict],
+    cache_dir: str | Path,
+    npz_mask_channel: str,
+    channel_sampling_mode: str,
+    max_all_channel_combos: int,
+    seed: int,
+    npz_cache_dir: str | Path | None,
+    semantic_classes: int,
+    split_name: str,
+    shard_index: int = 0,
+    num_shards: int = 1,
+) -> tuple[list[str], list[str], list[dict], list[str], list[np.ndarray]]:
+    cache_root = Path(cache_dir)
+    image_cache = cache_root / "images" / split_name
+    label_cache = cache_root / "semantic_flows" / split_name
+    image_cache.mkdir(parents=True, exist_ok=True)
+    label_cache.mkdir(parents=True, exist_ok=True)
+
+    image_service = ImageService()
+    train_files: list[str] = []
+    label_files: list[str] = []
+    valid_records: list[dict] = []
+    invalid: list[str] = []
+    class_prob_rows: list[np.ndarray] = []
+
+    num_shards = max(1, int(num_shards))
+    shard_index = max(0, int(shard_index))
+    if shard_index >= num_shards:
+        raise ValueError(f"shard_index={shard_index} must be < num_shards={num_shards}")
+
+    for index, row in enumerate(records, start=1):
+        if (index - 1) % num_shards != shard_index:
+            continue
+        frame_id = row.get("frame_id") or None
+        try:
+            image = load_image_ref(image_service, row["image"], frame_id, npz_cache_dir=npz_cache_dir)
+            mask, class_map = load_label_components(
+                row["label"],
+                frame_id=frame_id,
+                npz_mask_channel=npz_mask_channel,
+                npz_cache_dir=npz_cache_dir,
+            )
+            class_prob = class_probability_row(class_map, semantic_classes)
+            specs = channel_view_specs(
+                image,
+                channel_sampling_mode,
+                max_all_channel_combos,
+                random.Random(_record_seed(row, seed)),
+            )
+            flow_label = None
+            for view_name, channels in specs:
+                key = _cache_key(row, view_name)
+                image_path = image_cache / f"{key}_image.npy"
+                label_path = label_cache / f"{key}_semantic_flow.npy"
+                if not image_path.exists():
+                    view = make_three_channel_view(image, channels)
+                    _atomic_save_npy(image_path, view.astype(np.float32, copy=False))
+                if not label_path.exists():
+                    if flow_label is None:
+                        flow = dynamics.labels_to_flows([mask], files=None, device=torch.device("cpu"))[0]
+                        flow_label = insert_class_map([flow], [class_map])[0].astype(np.float32, copy=False)
+                    _atomic_save_npy(label_path, flow_label)
+                file_ref = f"{row['image']}::{frame_id}" if frame_id else row["image"]
+                valid_row = dict(row)
+                valid_row["channel_view"] = view_name
+                valid_row["source_group"] = f"{row['source_group']}|channels:{view_name}"
+                valid_row["cached_image"] = str(image_path)
+                valid_row["cached_semantic_flow"] = str(label_path)
+                valid_records.append(valid_row)
+                train_files.append(str(image_path))
+                label_files.append(str(label_path))
+                if class_prob is not None:
+                    class_prob_rows.append(class_prob)
+        except Exception as exc:
+            invalid.append(f"{row.get('image')}::{frame_id or ''} label={row.get('label')} error={exc}")
+        if index % 100 == 0:
+            print(f"cached {index}/{len(records)} {split_name} records")
+    if invalid:
+        print(f"skipped {len(invalid)} invalid {split_name} records")
+        for line in invalid[:20]:
+            print(f"  {line}")
+    return train_files, label_files, valid_records, invalid, class_prob_rows
 
 
 def records_for_split(records: Sequence[dict], split: str) -> list[dict]:
@@ -898,6 +1056,31 @@ def parse_args(argv: Sequence[str] | None = None):
         default=None,
         help="Directory for extracted .npz member .npy files. Required to train from large .npz archives efficiently.",
     )
+    parser.add_argument(
+        "--lazy-semantic-cache-dir",
+        default=None,
+        help=(
+            "Directory for lazy semantic training cache. When set with --semantic-classes > 0, "
+            "channel-view images and full semantic flow labels are written to disk and loaded per batch."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-cache-only",
+        action="store_true",
+        help="Build the lazy semantic cache for the selected records, then exit before model training.",
+    )
+    parser.add_argument(
+        "--semantic-cache-shard-index",
+        type=int,
+        default=0,
+        help="Shard index for --semantic-cache-only / lazy semantic cache generation.",
+    )
+    parser.add_argument(
+        "--semantic-cache-num-shards",
+        type=int,
+        default=1,
+        help="Number of shards for --semantic-cache-only / lazy semantic cache generation.",
+    )
     parser.add_argument("--use-validation-as-test", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--print-frozen-layers",
@@ -1050,39 +1233,84 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    train_data, train_labels, train_class_maps, train_files, valid_train_records, train_invalid = load_records(
-        train_records_loaded,
-        args.npz_mask_channel,
-        args.channel_sampling_mode,
-        args.max_all_channel_combos,
-        args.seed,
-        args.npz_cache_dir,
-    )
-    val_data, val_labels, val_class_maps, val_files, valid_val_records, val_invalid = load_records(
-        val_records_loaded,
-        args.npz_mask_channel,
-        args.channel_sampling_mode if args.channel_sampling_val else "none",
-        args.max_all_channel_combos,
-        args.seed + 1,
-        args.npz_cache_dir,
-    )
-    if not train_data:
-        raise ValueError("No valid training data loaded.")
+    lazy_semantic = bool(args.lazy_semantic_cache_dir) and args.semantic_classes > 0
+    train_data = train_labels = train_class_maps = val_data = val_labels = val_class_maps = None
+    train_label_files = val_label_files = None
+    train_class_prob_rows: list[np.ndarray] = []
+    if lazy_semantic:
+        print(f"lazy semantic cache enabled: {args.lazy_semantic_cache_dir}")
+        train_files, train_label_files, valid_train_records, train_invalid, train_class_prob_rows = build_lazy_semantic_cache(
+            train_records_loaded,
+            args.lazy_semantic_cache_dir,
+            args.npz_mask_channel,
+            args.channel_sampling_mode,
+            args.max_all_channel_combos,
+            args.seed,
+            args.npz_cache_dir,
+            args.semantic_classes,
+            "train",
+            args.semantic_cache_shard_index,
+            args.semantic_cache_num_shards,
+        )
+        val_files, val_label_files, valid_val_records, val_invalid, _val_class_prob_rows = build_lazy_semantic_cache(
+            val_records_loaded,
+            args.lazy_semantic_cache_dir,
+            args.npz_mask_channel,
+            args.channel_sampling_mode if args.channel_sampling_val else "none",
+            args.max_all_channel_combos,
+            args.seed + 1,
+            args.npz_cache_dir,
+            args.semantic_classes,
+            "val",
+            args.semantic_cache_shard_index,
+            args.semantic_cache_num_shards,
+        )
+        if args.semantic_cache_only:
+            print("semantic cache generation complete; exiting because --semantic-cache-only was set")
+            return 0
+        if args.semantic_cache_num_shards != 1:
+            raise ValueError(
+                "Training from lazy semantic cache requires --semantic-cache-num-shards 1. "
+                "Run sharded --semantic-cache-only jobs first, then run one unsharded training job to reuse all cache files."
+            )
+        if not train_files:
+            raise ValueError("No valid lazy cached training data.")
+    else:
+        train_data, train_labels, train_class_maps, train_files, valid_train_records, train_invalid = load_records(
+            train_records_loaded,
+            args.npz_mask_channel,
+            args.channel_sampling_mode,
+            args.max_all_channel_combos,
+            args.seed,
+            args.npz_cache_dir,
+        )
+        val_data, val_labels, val_class_maps, val_files, valid_val_records, val_invalid = load_records(
+            val_records_loaded,
+            args.npz_mask_channel,
+            args.channel_sampling_mode if args.channel_sampling_val else "none",
+            args.max_all_channel_combos,
+            args.seed + 1,
+            args.npz_cache_dir,
+        )
+        if not train_data:
+            raise ValueError("No valid training data loaded.")
     train_probs = source_balanced_probs(valid_train_records, args.balance_mode)
     if train_probs is not None:
         print(f"source-balanced sampling enabled across {len(set(row['source_group'] for row in valid_train_records))} valid groups")
     else:
         print("source-balanced sampling disabled")
-    print(f"valid training records loaded: {len(train_data)}/{len(train_records_loaded)}")
-    print(f"valid validation records loaded: {len(val_data)}/{len(val_records_loaded)}")
-    if len(train_data) != len(train_labels):
+    n_train_views = len(train_files) if lazy_semantic else len(train_data)
+    n_val_views = len(val_files) if lazy_semantic else len(val_data)
+    print(f"valid training records loaded: {n_train_views}/{len(train_records_loaded)}")
+    print(f"valid validation records loaded: {n_val_views}/{len(val_records_loaded)}")
+    if not lazy_semantic and len(train_data) != len(train_labels):
         raise ValueError(f"Internal loader error: train data/labels length mismatch ({len(train_data)} != {len(train_labels)})")
-    if len(train_data) != len(train_class_maps):
+    if not lazy_semantic and len(train_data) != len(train_class_maps):
         raise ValueError(
             f"Internal loader error: train data/class-map length mismatch ({len(train_data)} != {len(train_class_maps)})"
         )
-    if train_probs is not None and len(train_probs) != len(train_data):
-        raise ValueError(f"Internal loader error: train probabilities/data length mismatch ({len(train_probs)} != {len(train_data)})")
+    if train_probs is not None and len(train_probs) != n_train_views:
+        raise ValueError(f"Internal loader error: train probabilities/data length mismatch ({len(train_probs)} != {n_train_views})")
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     net = build_net(args.base_model, device, args.semantic_classes)
@@ -1122,13 +1350,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_labels_for_training = train_labels
     val_labels_for_training = val_labels
     if args.semantic_classes > 0:
-        valid_train_class_maps = valid_class_maps(train_class_maps)
+        valid_train_class_maps = [] if lazy_semantic else valid_class_maps(train_class_maps)
         max_class_id = max((int(np.max(cm)) for cm in valid_train_class_maps), default=-1)
         inferred_nclasses = infer_semantic_nclasses_from_net(net)
-        class_weights = compute_class_weights_from_class_maps(
-            valid_train_class_maps,
-            nclasses=args.semantic_classes if args.semantic_classes > 0 else inferred_nclasses,
-        )
+        if lazy_semantic:
+            class_weights = compute_class_weights_from_probability_rows(
+                train_class_prob_rows,
+                nclasses=args.semantic_classes if args.semantic_classes > 0 else inferred_nclasses,
+            )
+            if train_class_prob_rows:
+                max_class_id = max(len(row) for row in train_class_prob_rows)
+        else:
+            class_weights = compute_class_weights_from_class_maps(
+                valid_train_class_maps,
+                nclasses=args.semantic_classes if args.semantic_classes > 0 else inferred_nclasses,
+            )
         print(
             "semantic class-weight inputs: "
             f"valid_class_maps={len(valid_train_class_maps)} max_class_id={max_class_id} "
@@ -1138,21 +1374,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"semantic class weights ({len(class_weights)} classes incl. background): {class_weights.tolist()}")
         else:
             print("semantic class weights unavailable; using unweighted cross entropy")
-        print("precomputing semantic flow labels with class-map channel")
-        train_flow_labels = dynamics.labels_to_flows(train_labels, files=None, device=device)
-        train_labels_for_training = insert_class_map(train_flow_labels, train_class_maps)
-        if val_labels:
-            val_flow_labels = dynamics.labels_to_flows(val_labels, files=None, device=device)
-            val_labels_for_training = insert_class_map(val_flow_labels, val_class_maps)
+        if lazy_semantic:
+            print("using lazy precomputed semantic flow labels from cache")
+        else:
+            print("precomputing semantic flow labels with class-map channel")
+            train_flow_labels = dynamics.labels_to_flows(train_labels, files=None, device=device)
+            train_labels_for_training = insert_class_map(train_flow_labels, train_class_maps)
+            if val_labels:
+                val_flow_labels = dynamics.labels_to_flows(val_labels, files=None, device=device)
+                val_labels_for_training = insert_class_map(val_flow_labels, val_class_maps)
     model_path, train_losses, val_losses = cellpose_train.train_seg(
         net,
-        train_data=train_data,
+        train_data=None if lazy_semantic else train_data,
         train_labels=train_labels_for_training,
+        train_labels_files=train_label_files if lazy_semantic else None,
         train_probs=train_probs,
-        test_data=val_data if args.use_validation_as_test and val_data else None,
-        test_labels=val_labels_for_training if args.use_validation_as_test and val_data else None,
-        train_files=None,
-        test_files=None,
+        test_data=None if lazy_semantic else (val_data if args.use_validation_as_test and val_data else None),
+        test_labels=val_labels_for_training if (not lazy_semantic and args.use_validation_as_test and val_data) else None,
+        test_labels_files=val_label_files if lazy_semantic and args.use_validation_as_test and val_files else None,
+        train_files=train_files if lazy_semantic else None,
+        test_files=val_files if lazy_semantic and args.use_validation_as_test and val_files else None,
+        load_files=False if lazy_semantic else True,
         normalize=normalize_params,
         min_train_masks=0,
         batch_size=args.batch_size,
@@ -1160,8 +1402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rescale=False,
         scale_range=args.scale_range,
         save_path=str(output_dir),
-        nimg_per_epoch=args.nimg_per_epoch if args.nimg_per_epoch > 0 else len(train_data),
-        nimg_test_per_epoch=len(val_data) if args.use_validation_as_test and val_data else 0,
+        nimg_per_epoch=args.nimg_per_epoch if args.nimg_per_epoch > 0 else n_train_views,
+        nimg_test_per_epoch=n_val_views if args.use_validation_as_test and n_val_views else 0,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         n_epochs=args.epochs,
@@ -1171,6 +1413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_name=model_name,
         seg_loss_weight=args.seg_loss_weight,
         class_weights=class_weights,
+        keep_label_first_channel=lazy_semantic,
     )
     result_path = output_dir / "training_result.json"
     result_path.write_text(
@@ -1180,16 +1423,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "train_losses": train_losses.tolist() if hasattr(train_losses, "tolist") else train_losses,
                 "validation_losses": val_losses.tolist() if hasattr(val_losses, "tolist") else val_losses,
                 "split_manifest": str(split_manifest_path),
-                "n_train_records": len(train_data),
+                "n_train_records": n_train_views,
                 "n_requested_train_records": len(train_records_loaded),
                 "max_train_records_by_path": args.max_train_records_by_path,
-                "n_val_records": len(val_data),
+                "n_val_records": n_val_views,
                 "n_requested_val_records": len(val_records_loaded),
                 "n_test_records": len(test_records),
                 "semantic_classes": args.semantic_classes,
                 "semantic_class_weights": class_weights.tolist() if class_weights is not None else None,
                 "semantic_class_weighted_loss": bool(class_weights is not None),
-                "semantic_valid_class_maps": len(valid_class_maps(train_class_maps)) if args.semantic_classes > 0 else 0,
+                "semantic_valid_class_maps": (
+                    len(train_class_prob_rows) if lazy_semantic else len(valid_class_maps(train_class_maps))
+                ) if args.semantic_classes > 0 else 0,
+                "lazy_semantic_cache_dir": args.lazy_semantic_cache_dir,
+                "lazy_semantic_cache": lazy_semantic,
                 "npz_mask_channel": args.npz_mask_channel,
                 "npz_cache_dir": args.npz_cache_dir,
                 "channel_sampling_mode": args.channel_sampling_mode,

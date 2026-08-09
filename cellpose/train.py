@@ -1,6 +1,7 @@
 import time
 import os
 import numpy as np
+import tifffile
 from cellpose import io, utils, models, dynamics
 from cellpose.transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
@@ -159,8 +160,29 @@ def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}
         ]
     return data
 
+def _read_training_label_file(filename):
+    filename = str(filename)
+    ext = os.path.splitext(filename)[-1].lower()
+    if ext == ".npy":
+        arr = np.load(filename, allow_pickle=True)
+        if isinstance(arr, np.ndarray) and arr.dtype == object and arr.shape == ():
+            item = arr.item()
+            if isinstance(item, dict):
+                if "labels" in item:
+                    return item["labels"]
+                if "flows" in item:
+                    return item["flows"]
+                if "masks" in item:
+                    return item["masks"]
+            return item
+        return arr
+    if ext in (".tif", ".tiff"):
+        return tifffile.imread(filename)
+    return io.imread(filename)
+
+
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
-               normalize_params={"normalize": False}):
+               normalize_params={"normalize": False}, keep_label_first_channel=False):
     """
     Get a batch of images and labels.
 
@@ -180,7 +202,12 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         imgs = [io.imread(files[i]) for i in inds]
         imgs = _reshape_norm(imgs, normalize_params=normalize_params)
         if labels_files is not None:
-            lbls = [io.imread(labels_files[i])[1:] for i in inds]
+            lbls = []
+            for i in inds:
+                lbl = _read_training_label_file(labels_files[i])
+                if not keep_label_first_channel:
+                    lbl = lbl[1:]
+                lbls.append(lbl)
     else:
         imgs = [data[i] for i in inds]
         lbls = [labels[i] for i in inds]
@@ -215,7 +242,7 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
                         test_labels=None, test_files=None, test_labels_files=None,
                         test_probs=None, load_files=True, min_train_masks=5,
                         compute_flows=False, normalize_params={"normalize": False}, 
-                        channel_axis=None, device=None):
+                        channel_axis=None, device=None, keep_label_first_channel=False):
     """
     Process train and test data.
 
@@ -321,7 +348,7 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
     train_logger.info(">>> computing diameters")
     for k in trange(nimg):
         tl = (train_labels[k][0]
-              if train_labels is not None else io.imread(train_labels_files[k])[0])
+              if train_labels is not None else _read_training_label_file(train_labels_files[k])[0])
         diam_train[k], dall = utils.diameters(tl)
         nmasks[k] = len(dall)
     diam_train[diam_train < 5] = 5.
@@ -331,7 +358,7 @@ def _process_train_test(train_data=None, train_labels=None, train_files=None,
         diam_test[diam_test < 5] = 5.
     elif test_labels_files is not None:
         diam_test = np.array([
-            utils.diameters(io.imread(test_labels_files[k])[0])[0]
+            utils.diameters(_read_training_label_file(test_labels_files[k])[0])[0]
             for k in trange(len(test_labels_files))
         ])
         diam_test[diam_test < 5] = 5.
@@ -393,7 +420,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None, seg_loss_weight = 0.1,
-              early_stop=False, patience=3, min_delta=0.0, progress_callback=None):
+              early_stop=False, patience=3, min_delta=0.0, progress_callback=None,
+              keep_label_first_channel=False):
     """
     Train the network with images for segmentation.
 
@@ -469,7 +497,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                               test_probs=test_probs,
                               load_files=load_files, min_train_masks=min_train_masks,
                               compute_flows=compute_flows, channel_axis=channel_axis,
-                              normalize_params=normalize_params, device=net.device)
+                              normalize_params=normalize_params, device=net.device,
+                              keep_label_first_channel=keep_label_first_channel)
     (train_data, train_labels, train_files, train_labels_files, train_probs, diam_train,
      test_data, test_labels, test_files, test_labels_files, test_probs, diam_test,
      normed) = out
@@ -627,6 +656,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             t0_get = time.perf_counter()
             imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
                                     files=train_files, labels_files=train_labels_files,
+                                    keep_label_first_channel=keep_label_first_channel,
                                     **kwargs)
             t_get = time.perf_counter() - t0_get
             diams = np.array([diam_train[i] for i in inds])
@@ -712,6 +742,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         imgs, lbls = _get_batch(inds, data=test_data,
                                                 labels=test_labels, files=test_files,
                                                 labels_files=test_labels_files,
+                                                keep_label_first_channel=keep_label_first_channel,
                                                 **kwargs)
                         t_get = time.perf_counter() - t0_get
                         diams = np.array([diam_test[i] for i in inds])
