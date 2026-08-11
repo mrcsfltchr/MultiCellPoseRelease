@@ -7,7 +7,11 @@ from guv_app.services.segmentation_service import SegmentationService
 
 
 def image_service_without_thread():
-    return ImageService.__new__(ImageService)
+    svc = ImageService.__new__(ImageService)
+    svc._frame_cache = {}
+    svc._stack_axis_overrides = {}
+    svc._loaded_image_meta_cache = {}
+    return svc
 
 
 def test_prepare_image_array_drops_singleton_time_z_and_preserves_channels_last():
@@ -81,8 +85,6 @@ def test_image_service_iter_frames_keeps_sliced_tiff_frame_metadata_in_sync(tmp_
         },
     )
     svc = image_service_without_thread()
-    svc._frame_cache = {}
-    svc._stack_axis_overrides = {}
 
     refs = svc.build_frame_references(str(path))
     frames = svc.iter_image_frames(str(path))
@@ -94,6 +96,30 @@ def test_image_service_iter_frames_keeps_sliced_tiff_frame_metadata_in_sync(tmp_
     assert all(frame.meta.axes == "YXC" for frame in frames)
     assert loaded.shape == (24, 32, 3)
     assert int(loaded[..., 1].max()) == 77
+
+
+def test_ome_three_channel_tiff_is_not_treated_as_rgb(tmp_path):
+    path = tmp_path / "three_channel_fluorescence.ome.tif"
+    arr = np.zeros((3, 24, 32), dtype=np.uint16)
+    tifffile.imwrite(path, arr, ome=True, metadata={"axes": "CYX"})
+    svc = image_service_without_thread()
+
+    loaded = svc.load_image(str(path))
+
+    assert loaded.shape == (24, 32, 3)
+    assert not svc.is_loaded_image_rgb(str(path))
+
+
+def test_rgb_tiff_is_treated_as_rgb_display_image(tmp_path):
+    path = tmp_path / "rgb_display.tif"
+    arr = np.zeros((24, 32, 3), dtype=np.uint8)
+    tifffile.imwrite(path, arr, photometric="rgb")
+    svc = image_service_without_thread()
+
+    loaded = svc.load_image(str(path))
+
+    assert loaded.shape == (24, 32, 3)
+    assert svc.is_loaded_image_rgb(str(path))
 
 
 def test_prepare_image_array_preserves_ambiguous_two_plane_channels_first_stack():

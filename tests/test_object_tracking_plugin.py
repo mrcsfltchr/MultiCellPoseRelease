@@ -57,6 +57,25 @@ def test_tracking_recovers_after_short_gap_and_rejects_after_long_gap():
     assert int(new_after_gap.iloc[0]["track_id"]) == 2
 
 
+def test_tracking_class_filter_treats_wrong_class_frame_as_gap():
+    plugin = ObjectTrackingPlugin()
+    img0, m0 = _frame([(1, 4, 4, 4, 10.0)])
+    img1, m1 = _frame([(1, 5, 5, 4, 11.0)])
+    img2, m2 = _frame([(1, 6, 6, 4, 12.0)])
+    class1 = np.array([0, 1], dtype=np.int32)
+    class2 = np.array([0, 2], dtype=np.int32)
+
+    first = plugin.run(img0, m0, classes=class1, filename="movie.tif::T0", track_class_id="1", max_frame_gap=1)
+    missed = plugin.run(img1, m1, classes=class2, filename="movie.tif::T1", track_class_id="1", max_frame_gap=1)
+    recovered = plugin.run(img2, m2, classes=class1, filename="movie.tif::T2", track_class_id="1", max_frame_gap=1)
+
+    assert int(first.iloc[0]["track_id"]) == 1
+    assert missed.empty
+    assert int(recovered.iloc[0]["track_id"]) == 1
+    assert recovered.iloc[0]["status"] == "gap_closed"
+    assert int(recovered.iloc[0]["gap_frames"]) == 1
+
+
 def test_tracking_stack_input_is_pure_and_returns_all_frames():
     plugin = ObjectTrackingPlugin()
     img0, m0 = _frame([(1, 4, 4, 4, 10.0)])

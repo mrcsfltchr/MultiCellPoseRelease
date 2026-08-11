@@ -3,7 +3,8 @@
     "allow": [
       "Bash(\"/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe\" -c \"import sys; sys.path.insert\\(0, ''.''\\); from guv_app.plugins.plugin_validator import validate_all_plugins\")",
       "Bash(\"/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe\" -m scripts.validate_plugins)",
-      "Bash(\"/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe\" -c \":*)"
+      "Bash(\"/c/Users/mfletch1/AppData/Local/anaconda3/envs/cpsamSemanticGUI/python.exe\" -c \":*)",
+      "Bash(\"$LOCALAPPDATA/anaconda3/envs/cpsamSemanticGUI/python.exe\" scripts/validate_plugins.py)"
     ]
   }
 }
