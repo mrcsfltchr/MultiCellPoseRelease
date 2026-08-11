@@ -69,6 +69,8 @@ class ApplicationStateModel(QObject):
         self.selected_mask_ids = set()
         self.selected_reference_mask_id = None
         self.channel_segmentations = {}
+        self.channel_mask_mode = "shared"
+        self.image_is_rgb = False
         self.previous_channel_index = None
         self.association_groups = {}
         self.mask_associations = {}
@@ -115,7 +117,7 @@ class ApplicationStateModel(QObject):
         new_colors = np.random.randint(0, 255, (n_needed, 3), dtype=np.uint8)
         self.instance_colors = np.vstack([self.instance_colors, new_colors])
 
-    def update_image(self, image_data, filename, source_image=None):
+    def update_image(self, image_data, filename, source_image=None, is_rgb_image=False):
         """Updates the image and resets mask state.
 
         Args:
@@ -132,6 +134,7 @@ class ApplicationStateModel(QObject):
         self.display_image = image_data.copy()
         self.image_data = self.display_image
         self.filename = filename
+        self.image_is_rgb = bool(is_rgb_image)
 
         shape = image_data.shape
         # Heuristic to detect 2D RGB vs 3D Z-stack
@@ -141,7 +144,7 @@ class ApplicationStateModel(QObject):
         else: # 2D image (Y, X, C) or (Y, X)
             self.NZ = 1
             self.Ly, self.Lx = shape[0], shape[1]
-        channel_count = shape[2] if image_data.ndim == 3 else 1
+        channel_count = self._image_channel_count(image_data, self.image_is_rgb)
         if channel_count > 1:
             self.view_config.channel_index = min(prev_channel_index, channel_count - 1)
         else:
@@ -159,6 +162,7 @@ class ApplicationStateModel(QObject):
         self.pred_classes_map = None
         self.flows = []
         self.channel_segmentations = {}
+        self.channel_mask_mode = "shared"
         self.previous_channel_index = None
         self.selected_mask_ids = set()
         self.selected_reference_mask_id = None
@@ -327,13 +331,55 @@ class ApplicationStateModel(QObject):
         self.trigger_view_update()
         return True
 
+    def is_multichannel_image(self):
+        return (
+            self.raw_image is not None
+            and self.raw_image.ndim == 3
+            and self.NZ == 1
+            and not bool(getattr(self, "image_is_rgb", False))
+            and self.raw_image.shape[2] > 1
+            and self.raw_image.shape[2] <= 8
+        )
+
+    @staticmethod
+    def _image_channel_count(image, is_rgb_image=False):
+        if (
+            image is not None
+            and getattr(image, "ndim", 0) == 3
+            and not bool(is_rgb_image)
+            and image.shape[2] > 1
+            and image.shape[2] <= 8
+        ):
+            return int(image.shape[2])
+        return 1
+
+    def uses_per_channel_masks(self):
+        return getattr(self, "channel_mask_mode", "shared") == "per_channel"
+
+    def set_channel_mask_mode(self, mode):
+        mode = "per_channel" if mode == "per_channel" else "shared"
+        if mode == getattr(self, "channel_mask_mode", "shared"):
+            return
+        if mode == "per_channel":
+            self.persist_current_channel_state(force=True)
+        self.channel_mask_mode = mode
+        self.previous_channel_index = None
+
+    def enable_per_channel_masks(self):
+        self.set_channel_mask_mode("per_channel")
+
+    def use_shared_masks(self):
+        self.set_channel_mask_mode("shared")
+        self.channel_segmentations = {}
+        self.previous_channel_index = None
+
     def get_current_channel_index(self):
-        if self.raw_image is not None and self.raw_image.ndim == 3 and self.raw_image.shape[2] not in (1, 3):
+        if self.is_multichannel_image():
             return int(self.view_config.channel_index)
         return 0
 
     def get_channel_count(self):
-        if self.raw_image is not None and self.raw_image.ndim == 3 and self.raw_image.shape[2] not in (1, 3):
+        if self.is_multichannel_image():
             return int(self.raw_image.shape[2])
         return 1
 
@@ -374,7 +420,9 @@ class ApplicationStateModel(QObject):
             "flows": [np.array(item, copy=True) if isinstance(item, np.ndarray) else item for item in (self.flows or [])],
         }
 
-    def persist_current_channel_state(self):
+    def persist_current_channel_state(self, force=False):
+        if not force and not self.uses_per_channel_masks():
+            return
         idx = self.get_current_channel_index()
         if self.cellpix is None:
             self.channel_segmentations[idx] = self._blank_channel_state()
@@ -382,6 +430,8 @@ class ApplicationStateModel(QObject):
             self.channel_segmentations[idx] = self._state_from_current()
 
     def restore_channel_state(self, channel_index):
+        if not self.uses_per_channel_masks():
+            return
         idx = int(channel_index)
         state = self.channel_segmentations.get(idx)
         if state is None:
@@ -746,6 +796,8 @@ class ApplicationStateModel(QObject):
         return segments
 
     def export_channel_segmentations(self):
+        if not self.uses_per_channel_masks():
+            return None
         payload = {}
         current_idx = self.get_current_channel_index()
         seen = set(self.channel_segmentations.keys()) | {current_idx}
@@ -762,6 +814,7 @@ class ApplicationStateModel(QObject):
 
     def load_channel_segmentations(self, payload, active_channel_index=0, switch_channel=True):
         self.channel_segmentations = {}
+        self.channel_mask_mode = "per_channel"
         if payload:
             for key, state in payload.items():
                 idx = int(key)
@@ -1111,7 +1164,7 @@ class ApplicationStateModel(QObject):
                     else self.get_current_channel_index()
                 )
                 current_channel = self.get_current_channel_index()
-                if result_channel == current_channel:
+                if not self.uses_per_channel_masks() or result_channel == current_channel:
                     # Same channel as the live display — update live buffer directly.
                     # When masks are frozen, preserve existing masks and merge new ones
                     # on top (union).  Otherwise replace entirely.
@@ -1277,24 +1330,37 @@ class ApplicationStateModel(QObject):
                 "flows": result.flows or [],
             }
 
-        channel_segs = {}
+        channel_segs_existing = {}
         try:
             if os.path.exists(pred_path):
                 existing = np.load(pred_path, allow_pickle=True).item()
                 existing_ch = existing.get("channel_segmentations") or {}
                 for k, v in existing_ch.items():
                     try:
-                        channel_segs[int(k)] = v
+                        masks_existing = v.get("masks") if isinstance(v, dict) else None
+                        if masks_existing is not None and int(np.asarray(masks_existing).max()) > 0:
+                            channel_segs_existing[int(k)] = v
                     except (ValueError, TypeError):
                         pass
         except Exception:
             pass
 
-        if self.view_config.masks_frozen and channel_index in channel_segs:
-            existing_state = channel_segs[channel_index]
-            if existing_state.get("masks") is not None:
-                this_channel_state = self._merge_channel_states_frozen(existing_state, this_channel_state)
-        channel_segs[channel_index] = this_channel_state
+        save_per_channel = bool(channel_segs_existing)
+        if not save_per_channel and self.uses_per_channel_masks():
+            save_per_channel = (
+                result.filename == self.filename
+                and (result.frame_id is None or result.frame_id == self.frame_id)
+            )
+
+        channel_segs = None
+        if save_per_channel:
+            channel_segs = dict(channel_segs_existing)
+
+            if self.view_config.masks_frozen and channel_index in channel_segs:
+                existing_state = channel_segs[channel_index]
+                if existing_state.get("masks") is not None:
+                    this_channel_state = self._merge_channel_states_frozen(existing_state, this_channel_state)
+            channel_segs[channel_index] = this_channel_state
 
         ismanual = np.zeros(n, bool)
         dat = {
@@ -1311,6 +1377,7 @@ class ApplicationStateModel(QObject):
             "class_names": result.class_names,
             "class_colors": result.class_colors,
             "active_channel_index": channel_index,
-            "channel_segmentations": {str(k): v for k, v in channel_segs.items()},
+            "channel_mask_mode": "per_channel" if channel_segs else "shared",
+            "channel_segmentations": {str(k): v for k, v in channel_segs.items()} if channel_segs else None,
         }
         np.save(pred_path, dat)

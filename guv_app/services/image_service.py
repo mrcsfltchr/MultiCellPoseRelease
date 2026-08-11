@@ -22,6 +22,7 @@ class ImageService:
         self._nd2_dask_cache = {}
         self._nd2_meta_cache = {}
         self._frame_cache = {}
+        self._loaded_image_meta_cache = {}
         self._stack_axis_overrides = {}
         self._save_lock = threading.Lock()
         self._save_cv = threading.Condition(self._save_lock)
@@ -45,6 +46,48 @@ class ImageService:
 
     def _normalize_path_key(self, filename):
         return os.path.normcase(os.path.normpath(filename))
+
+    def _image_reference_key(self, filename, frame_id=None):
+        return self._normalize_path_key(self.build_image_reference(filename, frame_id))
+
+    def get_loaded_image_info(self, filename, frame_id=None):
+        return self._loaded_image_meta_cache.get(self._image_reference_key(filename, frame_id), {})
+
+    def is_loaded_image_rgb(self, filename, frame_id=None):
+        return bool(self.get_loaded_image_info(filename, frame_id).get("is_rgb", False))
+
+    def _record_loaded_image_info(self, filename, frame_id, image, meta=None):
+        info = {
+            "shape": tuple(np.asarray(image).shape) if image is not None else None,
+            "axes": getattr(meta, "axes", None) if meta is not None else None,
+            "is_rgb": self._detect_rgb_image(filename, image, meta),
+        }
+        self._loaded_image_meta_cache[self._image_reference_key(filename, frame_id)] = info
+
+    def _detect_rgb_image(self, filename, image, meta=None):
+        arr = np.asarray(image) if image is not None else None
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg", ".bmp"):
+            return arr is not None and arr.ndim == 3 and arr.shape[-1] in (3, 4)
+        if ext not in (".tif", ".tiff", ".flex"):
+            return False
+        if arr is None or arr.ndim != 3 or arr.shape[-1] not in (3, 4):
+            return False
+        try:
+            with tifffile.TiffFile(filename) as tif:
+                series = tif.series[0]
+                axes = getattr(series, "axes", None)
+                if isinstance(axes, str) and "S" in axes:
+                    return True
+                first_page = tif.pages[0] if len(tif.pages) else None
+                photometric = getattr(first_page, "photometric", None) if first_page is not None else None
+                photometric_name = str(getattr(photometric, "name", photometric)).upper()
+                if "RGB" in photometric_name:
+                    return True
+        except Exception:
+            pass
+        axes = getattr(meta, "axes", None) if meta is not None else None
+        return bool(isinstance(axes, str) and "S" in axes)
 
     def get_stack_axis_override(self, filename):
         return self._stack_axis_overrides.get(self._normalize_path_key(filename))
@@ -200,6 +243,7 @@ class ImageService:
                 _logger.error(f"Failed to load image: {filename}")
                 return None
 
+            self._record_loaded_image_info(filename, None, image, meta)
             return image
         except Exception as e:
             _logger.error(f"Error loading image {filename}: {e}")
@@ -284,15 +328,22 @@ class ImageService:
                     sizes=self._sizes_from_axes(frame_axes, tuple(frame_arr.shape)),
                     dtype=frame_arr.dtype,
                 )
-                return self._prepare_image_array(frame_arr, frame_meta)
+                image = self._prepare_image_array(frame_arr, frame_meta)
+                self._record_loaded_image_info(filename, frame_id, image, frame_meta)
+                return image
         frame = io.read_image_frame(filename, frame_id)
         if frame is not None:
             arr, meta = self._apply_stack_axis_override(filename, frame.array, getattr(frame, "meta", None))
-            return self._prepare_image_array(arr, meta)
+            image = self._prepare_image_array(arr, meta)
+            self._record_loaded_image_info(filename, frame_id, image, meta)
+            return image
         frames = self.iter_image_frames(filename, frame_id=frame_id)
         for frame in frames:
             if frame.frame_id == frame_id:
-                return self._prepare_image_array(frame.array, getattr(frame, "meta", None))
+                meta = getattr(frame, "meta", None)
+                image = self._prepare_image_array(frame.array, meta)
+                self._record_loaded_image_info(filename, frame_id, image, meta)
+                return image
         _logger.error(f"Frame {frame_id} not found for {filename}")
         return None
 
@@ -904,9 +955,13 @@ class ImageService:
         """Loads segmentation data from a .npy file and returns a dict with masks, classes, etc."""
         dat = np.load(filename, allow_pickle=True).item()
         channel_segmentations = dat.get("channel_segmentations")
+        has_channel_masks = self._channel_segmentations_have_masks(channel_segmentations)
+        channel_mask_mode = dat.get("channel_mask_mode")
+        if channel_mask_mode not in ("shared", "per_channel"):
+            channel_mask_mode = "per_channel" if has_channel_masks else "shared"
         active_channel_index = int(dat.get("active_channel_index", 0))
         active_state = None
-        if channel_segmentations:
+        if has_channel_masks:
             active_state = channel_segmentations.get(str(active_channel_index))
             if active_state is None and channel_segmentations:
                 first_key = sorted(channel_segmentations.keys(), key=lambda x: int(x))[0]
@@ -924,7 +979,9 @@ class ImageService:
 
         classes = dat.get("classes")
         if classes is None and active_state is not None:
-            classes = active_state.get("classes")
+            classes = active_state.get("mask_classes")
+            if classes is None:
+                classes = active_state.get("classes")
         if classes is None:
             classes_map = dat.get("classes_map")
             if classes_map is None and active_state is not None:
@@ -953,10 +1010,23 @@ class ImageService:
             "class_names": dat.get("class_names"),
             "class_colors": dat.get("class_colors"),
             "object_ids": dat.get("object_ids"),
-            "channel_segmentations": channel_segmentations,
+            "channel_segmentations": channel_segmentations if has_channel_masks else None,
+            "channel_mask_mode": channel_mask_mode,
             "associations": dat.get("associations"),
             "active_channel_index": active_channel_index,
         }
+
+    @staticmethod
+    def _channel_segmentations_have_masks(channel_segmentations):
+        if not channel_segmentations:
+            return False
+        for state in channel_segmentations.values():
+            if not isinstance(state, dict):
+                continue
+            masks = state.get("masks")
+            if masks is not None and int(np.asarray(masks).max()) > 0:
+                return True
+        return False
 
     def _safe_array_copy(self, value):
         if value is None:
@@ -1012,6 +1082,7 @@ class ImageService:
             "diameter": getattr(model, "diameter", None),
             "object_ids": np.array(model.get_object_ids_for_channel(), copy=True) if hasattr(model, "get_object_ids_for_channel") else np.zeros(nmask + 1, dtype=np.int32),
             "channel_segmentations": model.export_channel_segmentations() if hasattr(model, "export_channel_segmentations") else None,
+            "channel_mask_mode": "per_channel" if getattr(model, "uses_per_channel_masks", lambda: False)() else "shared",
             "associations": model.export_associations() if hasattr(model, "export_associations") else None,
             "active_channel_index": int(model.get_current_channel_index()) if hasattr(model, "get_current_channel_index") else 0,
         }
@@ -1086,6 +1157,7 @@ class ImageService:
         dat["class_colors"] = payload.get("class_colors")
         dat["object_ids"] = payload.get("object_ids")
         dat["channel_segmentations"] = payload.get("channel_segmentations")
+        dat["channel_mask_mode"] = payload.get("channel_mask_mode", "shared")
         dat["associations"] = payload.get("associations")
         dat["active_channel_index"] = int(payload.get("active_channel_index", 0))
         self._write_npy_atomic(save_path, dat)
@@ -1107,6 +1179,7 @@ class ImageService:
             "diameter": payload.get("diameter"),
             "object_ids": payload.get("object_ids"),
             "channel_segmentations": payload.get("channel_segmentations"),
+            "channel_mask_mode": payload.get("channel_mask_mode", "shared"),
             "associations": payload.get("associations"),
             "active_channel_index": int(payload.get("active_channel_index", 0)),
         }

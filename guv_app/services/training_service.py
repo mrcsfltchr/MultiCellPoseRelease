@@ -188,6 +188,73 @@ def _initialize_class_net(nclasses=2, device=None):
     return net
 
 
+def _expand_net_to_semantic_classes(net, nclasses, device=None):
+    """Expand a loaded Cellpose-SAM transformer head for semantic class output."""
+    nclasses = int(max(1, nclasses))
+    device = device or getattr(net, "device", None) or _resolve_training_device()
+    net = net.to(device)
+    ps = int(getattr(net, "ps", 8))
+    nout = 3
+    old_w = net.out.weight.data.detach().clone()
+    old_b = net.out.bias.data.detach().clone()
+    old_maps = int(old_w.shape[0] // (ps**2))
+    old_semantic = max(0, old_maps - nout)
+    target_maps = nout + nclasses
+
+    if old_maps == target_maps:
+        return net
+
+    old_seg_start = max(0, old_w.shape[0] - nout * ps**2)
+    old_seg_w = old_w[old_seg_start:]
+    old_seg_b = old_b[old_seg_start:]
+    cellprob_w = old_seg_w[(nout - 1) * ps**2:nout * ps**2]
+    cellprob_b = old_seg_b[(nout - 1) * ps**2:nout * ps**2]
+
+    new_out = nn.Conv2d(int(old_w.shape[1]), target_maps * ps**2, kernel_size=1).to(device)
+    new_out.weight.data.zero_()
+    new_out.bias.data.zero_()
+
+    copy_classes = min(old_semantic, nclasses)
+    if copy_classes > 0:
+        new_out.weight.data[:copy_classes * ps**2] = old_w[:copy_classes * ps**2]
+        new_out.bias.data[:copy_classes * ps**2] = old_b[:copy_classes * ps**2]
+    else:
+        new_out.weight.data[:ps**2] = -0.5 * cellprob_w
+        new_out.bias.data[:ps**2] = cellprob_b
+
+    base_w = 0.5 * cellprob_w
+    base_b = cellprob_b
+    perturb_scale = 1e-2 * float(base_w.abs().mean()) if base_w.numel() else 1e-3
+    gen = torch.Generator().manual_seed(0)
+    for i in range(max(1, copy_classes), nclasses):
+        noise = (perturb_scale * torch.randn(base_w.shape, generator=gen)).to(device)
+        new_out.weight.data[i * ps**2:(i + 1) * ps**2] = base_w + noise
+        new_out.bias.data[i * ps**2:(i + 1) * ps**2] = base_b
+
+    seg_start = nclasses * ps**2
+    new_out.weight.data[seg_start:seg_start + nout * ps**2] = old_seg_w[-nout * ps**2:]
+    new_out.bias.data[seg_start:seg_start + nout * ps**2] = old_seg_b[-nout * ps**2:]
+
+    net.out = new_out
+    net.nout = target_maps
+    net.W2 = nn.Parameter(
+        torch.eye(target_maps * ps**2, device=device).reshape(target_maps * ps**2, target_maps, ps, ps),
+        requires_grad=False,
+    )
+    net.to(device)
+    return net
+
+
+def initialize_training_net(base_model, semantic_classes=None, use_gpu=True):
+    if semantic_classes is not None and int(semantic_classes) > 0:
+        if os.path.basename(str(base_model)) == "cpsam":
+            return _initialize_class_net(nclasses=int(semantic_classes))
+        model = models.CellposeModel(pretrained_model=base_model, gpu=use_gpu)
+        return _expand_net_to_semantic_classes(model.net, int(semantic_classes))
+    model = models.CellposeModel(pretrained_model=base_model, gpu=use_gpu)
+    return model.net
+
+
 def _train_seg_with_progress(
     net,
     device,
@@ -479,7 +546,9 @@ class TrainingService:
         train_labels_for_training = train_labels
         test_labels_for_training = test_labels
 
-        if class_maps:
+        use_semantic_labels = bool(getattr(config, "semantic_training", False)) and bool(class_maps)
+
+        if use_semantic_labels:
             if train_labels_for_training is not None and (
                 not flow_labels or any(lbl is None for lbl in flow_labels)
             ):
@@ -489,7 +558,12 @@ class TrainingService:
             train_labels_for_training = _insert_class_map(
                 train_labels_for_training, class_maps
             )
-        if test_class_maps:
+        elif class_maps:
+            train_logger.info(
+                "GUI_INFO: class maps detected but semantic training is disabled; training class-agnostic instance model."
+            )
+
+        if bool(getattr(config, "semantic_training", False)) and test_class_maps:
             if test_labels_for_training is not None and (
                 not test_flow_labels or any(lbl is None for lbl in test_flow_labels)
             ):
@@ -515,7 +589,7 @@ class TrainingService:
 
         nclasses_inferred = infer_semantic_nclasses_from_net(self.net)
         valid_class_maps = []
-        if class_maps:
+        if use_semantic_labels:
             for cm in class_maps:
                 if cm is None:
                     continue
@@ -529,6 +603,12 @@ class TrainingService:
         class_weights = compute_class_weights_from_class_maps(
             valid_class_maps, nclasses=nclasses_inferred
         )
+        if use_semantic_labels and max_class_id >= 0 and nclasses_inferred is not None and nclasses_inferred <= max_class_id:
+            raise ValueError(
+                "Semantic training requested but model output head has "
+                f"{nclasses_inferred} class channels for labels up to class id {max_class_id}. "
+                "Recreate the semantic model head with enough classes."
+            )
         train_logger.info(
             "GUI_INFO: class-weight inputs: valid_class_maps=%s max_class_id=%s inferred_nclasses=%s",
             len(valid_class_maps),
@@ -549,7 +629,7 @@ class TrainingService:
             train_logger.info(
                 "GUI_INFO: class-weight outputs: weight_vector_length=0 (unweighted CE fallback)"
             )
-        if class_maps:
+        if use_semantic_labels:
             try:
                 max_classes = [int(np.max(cm)) for cm in class_maps if cm is not None]
                 if max_classes:

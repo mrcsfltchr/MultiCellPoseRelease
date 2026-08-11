@@ -24,6 +24,7 @@ class TrainingConfig:
     scale_range: float = 0.5
     seg_loss_weight: float = 0.1
     class_loss_weight: float = 1.0
+    semantic_training: bool = False
     nimg_per_epoch: Optional[int] = None
     use_lora: bool = False
     lora_blocks: Optional[int] = None

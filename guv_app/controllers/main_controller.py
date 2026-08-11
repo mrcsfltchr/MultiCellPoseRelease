@@ -372,8 +372,9 @@ class MainController(QObject):
         if normalized_data is None:
             _logger.error(f"Controller: Unsupported image data for {filename}")
             return
+        image_is_rgb = self.image_service.is_loaded_image_rgb(filename, frame_id)
         if hasattr(self.view, "control_panel"):
-            if image_data.ndim == 3 and image_data.shape[2] > 1:
+            if image_data.ndim == 3 and 1 < image_data.shape[2] <= 8 and not image_is_rgb:
                 channel_count = image_data.shape[2]
             else:
                 channel_count = 1
@@ -392,9 +393,14 @@ class MainController(QObject):
         else:
             self.model.current_z_index = 0
         self.model.z_count = self.image_service.get_z_info(filename, frame_id=frame_id)
-        self.model.update_image(normalized_data, filename, source_image=source_image)
+        self.model.update_image(
+            normalized_data,
+            filename,
+            source_image=source_image,
+            is_rgb_image=image_is_rgb,
+        )
         if preserve_frame_view_state and self.model.raw_image is not None:
-            if self.model.raw_image.ndim == 3 and self.model.raw_image.shape[2] > 1:
+            if self.model.is_multichannel_image():
                 self.model.view_config.channel_index = min(
                     preserved_channel_index,
                     self.model.raw_image.shape[2] - 1,
@@ -408,7 +414,7 @@ class MainController(QObject):
                 self.view.run_plugin_series_button.setEnabled(bool(self.model.frame_refs))
         if hasattr(self.view, "update_window_title"):
             self.view.update_window_title(filename, frame_id)
-        if self.model.raw_image is not None and self.model.raw_image.ndim == 3:
+        if self.model.raw_image is not None and self.model.is_multichannel_image():
             chan_count = self.model.raw_image.shape[2]
             if chan_count > 1:
                 msg = f"Channel: {self.model.view_config.channel_index + 1}/{chan_count}"
@@ -561,31 +567,12 @@ class MainController(QObject):
                             self.model.load_associations(associations)
                             success = True
                         else:
+                            self.model.use_shared_masks()
                             success = self.model.add_masks(masks, classes=classes)
-                            if success:
-                                self.model.persist_current_channel_state()
                             self.model.load_associations(associations)
-                    elif active_channel_index != self.model.get_current_channel_index() and self.model.get_channel_count() > 1:
-                        n_masks = int(np.asarray(masks).max()) if raw_masks_have_data else 0
-                        instance_colors = np.random.randint(0, 255, (n_masks + 1, 3), dtype=np.uint8)
-                        payload = {
-                            str(active_channel_index): {
-                                "masks": masks,
-                                "classes": classes,
-                                "instance_colors": instance_colors,
-                            }
-                        }
-                        self.model.load_channel_segmentations(
-                            payload,
-                            active_channel_index=active_channel_index,
-                            switch_channel=False,
-                        )
-                        self.model.load_associations(associations)
-                        success = True
                     else:
+                        self.model.use_shared_masks()
                         success = self.model.add_masks(masks, classes=classes)
-                        if success:
-                            self.model.persist_current_channel_state()
                         self.model.load_associations(associations)
 
                     if success:
@@ -635,8 +622,7 @@ class MainController(QObject):
         if not hasattr(self.view.control_panel, 'sliders'):
             return
             
-        # Determine if image is RGB or Grayscale
-        is_rgb = image.ndim == 3 and image.shape[2] == 3
+        is_rgb = image.ndim == 3 and image.shape[2] == 3 and bool(getattr(self.model, "image_is_rgb", False))
         
         # Block signals to prevent update loops during init
         for slider in self.view.control_panel.sliders:
@@ -1354,7 +1340,7 @@ class MainController(QObject):
 
     def handle_color_mode_change(self, index):
         img = self.model.raw_image
-        if img is not None and img.ndim == 3 and img.shape[2] not in (1, 3):
+        if self.model.is_multichannel_image():
             chan_count = img.shape[2]
             self._set_channel_index(index % chan_count)
             return
@@ -1422,7 +1408,7 @@ class MainController(QObject):
 
     def _apply_levels(self, image):
         img = image.copy()
-        is_rgb = img.ndim == 3 and img.shape[2] == 3
+        is_rgb = img.ndim == 3 and img.shape[2] == 3 and bool(getattr(self.model, "image_is_rgb", False))
         if not hasattr(self.view.control_panel, "sliders"):
             return np.clip(img, 0, 1)
 
@@ -1449,8 +1435,8 @@ class MainController(QObject):
 
     def _apply_color_mode(self, image, color_mode):
         img = image
-        is_rgb = img.ndim == 3 and img.shape[2] == 3
-        is_multichannel = img.ndim == 3 and img.shape[2] not in (1, 3)
+        is_rgb = img.ndim == 3 and img.shape[2] == 3 and bool(getattr(self.model, "image_is_rgb", False))
+        is_multichannel = self.model.is_multichannel_image()
         if is_multichannel:
             chan_idx = int(self.model.view_config.channel_index)
             chan_idx = max(0, min(chan_idx, img.shape[2] - 1))
@@ -1485,7 +1471,7 @@ class MainController(QObject):
         img = self.model.raw_image
         if img is None:
             return False
-        if img.ndim == 3 and img.shape[2] not in (1, 3):
+        if self.model.is_multichannel_image():
             chan_count = img.shape[2]
             idx = int(self.model.view_config.channel_index)
             if abs(delta) <= 3:
@@ -1502,15 +1488,21 @@ class MainController(QObject):
         img = self.model.raw_image
         if img is None or img.ndim != 3:
             return
+        if not self.model.is_multichannel_image():
+            return
         chan_count = img.shape[2]
         new_idx = max(0, min(int(new_idx), chan_count - 1))
         old_idx = int(self.model.view_config.channel_index)
         if new_idx == old_idx:
             return
-        self.model.persist_current_channel_state()
-        self.model.previous_channel_index = old_idx if self.model.channel_has_masks(old_idx) else None
+        if self.model.uses_per_channel_masks():
+            self.model.persist_current_channel_state()
+            self.model.previous_channel_index = old_idx if self.model.channel_has_masks(old_idx) else None
+        else:
+            self.model.previous_channel_index = None
         self.model.view_config.channel_index = new_idx
-        self.model.restore_channel_state(new_idx)
+        if self.model.uses_per_channel_masks():
+            self.model.restore_channel_state(new_idx)
         self._apply_display_modes()
         ref_text = f" | ref {self.model.previous_channel_index + 1}" if self.model.previous_channel_index is not None else ""
         self.view.statusBar().showMessage(f"Channel: {new_idx + 1}/{chan_count}{ref_text}")
@@ -1592,6 +1584,7 @@ class MainController(QObject):
             self.model.load_associations(associations)
             success = True
         else:
+            self.model.use_shared_masks()
             success = self.model.add_masks(seg["masks"], classes=seg["classes"])
             self.model.load_associations(associations)
         if not success:
@@ -1606,6 +1599,8 @@ class MainController(QObject):
 
     def handle_toggle_association_mode(self, enabled):
         enabled = bool(enabled)
+        if enabled:
+            self.model.enable_per_channel_masks()
         self.model.clear_reference_selection()
         if hasattr(self.view, "set_association_mode_enabled"):
             self.view.set_association_mode_enabled(enabled)
@@ -1617,6 +1612,7 @@ class MainController(QObject):
         )
 
     def handle_auto_associate_previous_channel(self):
+        self.model.enable_per_channel_masks()
         matched, message = self.model.auto_associate_with_previous_channel()
         self.model.trigger_view_update()
         self.view.statusBar().showMessage(message)
@@ -1624,6 +1620,7 @@ class MainController(QObject):
             self._trigger_autosave()
 
     def handle_link_selected_association(self):
+        self.model.enable_per_channel_masks()
         current_channel = self.model.get_current_channel_index()
         reference_channel = self.model.previous_channel_index
         selected_ids = sorted(self.model.get_selected_mask_ids())

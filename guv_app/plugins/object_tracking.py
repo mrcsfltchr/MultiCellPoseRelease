@@ -168,6 +168,12 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 "label": "Match Same Class Only",
                 "help": "When classes are available, only match detections with the same class ID.",
             },
+            "track_class_id": {
+                "type": "str",
+                "default": "all",
+                "label": "Track Class",
+                "help": "Use 'all' or a one-based class ID. Detections from other classes are treated as missing frames.",
+            },
             "min_area_px": {
                 "type": "int",
                 "default": 1,
@@ -223,6 +229,7 @@ class ObjectTrackingPlugin(AnalysisPlugin):
             classes=classes,
             frame_index=frame_index,
             min_area=max(1, int(kwargs.get("min_area_px", 1))),
+            track_class_id=_parse_track_class_id(kwargs.get("track_class_id", kwargs.get("class_filter", "all"))),
             local_background_subtraction=bool(kwargs.get("local_background_subtraction", True)),
             background_inner_gap_px=max(0, int(kwargs.get("background_inner_gap_px", 2))),
             background_outer_radius_px=max(1, int(kwargs.get("background_outer_radius_px", 12))),
@@ -281,6 +288,7 @@ class ObjectTrackingPlugin(AnalysisPlugin):
                 classes=frame_classes,
                 frame_index=frame_index,
                 min_area=max(1, int(kwargs.get("min_area_px", 1))),
+                track_class_id=_parse_track_class_id(kwargs.get("track_class_id", kwargs.get("class_filter", "all"))),
                 local_background_subtraction=bool(kwargs.get("local_background_subtraction", True)),
                 background_inner_gap_px=max(0, int(kwargs.get("background_inner_gap_px", 2))),
                 background_outer_radius_px=max(1, int(kwargs.get("background_outer_radius_px", 12))),
@@ -569,6 +577,19 @@ def _parse_channel(value) -> Optional[int]:
         return None
 
 
+def _parse_track_class_id(value) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"", "all", "any", "*", "none"}:
+        return None
+    try:
+        class_id = int(float(text))
+    except Exception:
+        return None
+    return class_id if class_id > 0 else None
+
+
 def _extract_detections(
     tracking_image: Optional[np.ndarray],
     measurement_images: Dict[str, np.ndarray],
@@ -576,6 +597,7 @@ def _extract_detections(
     classes: np.ndarray = None,
     frame_index: int = 0,
     min_area: int = 1,
+    track_class_id: Optional[int] = None,
     local_background_subtraction: bool = True,
     background_inner_gap_px: int = 2,
     background_outer_radius_px: int = 12,
@@ -638,6 +660,9 @@ def _extract_detections(
     for mask_id in mask_ids:
         if area[mask_id] < min_area:
             continue
+        class_id = _safe_class(classes, masks2d, int(mask_id))
+        if track_class_id is not None and class_id != track_class_id:
+            continue
         region = masks2d == mask_id
         ys, xs = np.nonzero(region)
         height = max(1, int(ys.max() - ys.min() + 1))
@@ -669,7 +694,7 @@ def _extract_detections(
             _Detection(
                 frame_index=int(frame_index),
                 mask_id=int(mask_id),
-                class_id=_safe_class(classes, int(mask_id)),
+                class_id=class_id,
                 area=float(area[mask_id]),
                 centroid_y=float(sum_y[mask_id] / area[mask_id]),
                 centroid_x=float(sum_x[mask_id] / area[mask_id]),
@@ -701,13 +726,34 @@ def _perimeter_by_label(masks2d: np.ndarray, max_label: int) -> np.ndarray:
     return np.bincount(center[boundary].ravel(), minlength=max_label + 1).astype(np.float64)
 
 
-def _safe_class(classes: np.ndarray, mask_id: int) -> int:
+def _safe_class(classes: np.ndarray, masks2d: np.ndarray, mask_id: int) -> int:
     if classes is None:
         return 0
     arr = np.asarray(classes)
-    if arr.ndim != 1 or mask_id < 0 or mask_id >= len(arr):
-        return 0
-    return int(arr[mask_id])
+    if arr.ndim == 1:
+        if mask_id < 0 or mask_id >= len(arr):
+            return 0
+        return int(arr[mask_id])
+    if arr.shape == masks2d.shape:
+        values = arr[masks2d == mask_id]
+        values = values[np.isfinite(values)] if np.issubdtype(values.dtype, np.number) else values
+        if values.size == 0:
+            return 0
+        labels, counts = np.unique(values.astype(np.int64, copy=False), return_counts=True)
+        foreground = labels > 0
+        if foreground.any():
+            labels = labels[foreground]
+            counts = counts[foreground]
+        return int(labels[int(np.argmax(counts))]) if labels.size else 0
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        return _safe_class(arr[0], masks2d, mask_id)
+    if arr.ndim == 2 and arr.shape[-1] == 1:
+        return _safe_class(arr[:, 0], masks2d, mask_id)
+    if arr.ndim >= 2 and arr.shape[0] > mask_id and arr.shape[1] == 1:
+        return int(arr[mask_id, 0])
+    if arr.ndim >= 2 and arr.shape[-1] > mask_id and arr.shape[0] == 1:
+        return int(arr[0, mask_id])
+    return 0
 
 
 def _finite_mean_or_nan(values) -> float:

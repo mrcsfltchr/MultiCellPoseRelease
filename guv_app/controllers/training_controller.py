@@ -1,5 +1,6 @@
 import os
 import time
+import numpy as np
 from PyQt6.QtCore import QSettings
 from urllib.parse import urlparse
 
@@ -267,11 +268,13 @@ class TrainerController(MainController):
 
         model_names = self._get_available_models_for_training()
         default_name = f"{self.model.current_model_id or 'cpsam'}_{time.strftime('%Y%m%d_%H%M%S')}"
+        semantic_default = self._has_semantic_class_maps(class_maps)
         default_config = TrainingConfig(
             base_model=self.model.current_model_id or "cpsam",
             model_name=default_name,
             lora_blocks=9,
             unfreeze_blocks=9,
+            semantic_training=semantic_default,
         )
         if hasattr(self.view, "prompt_training_config"):
             config = self.view.prompt_training_config(
@@ -344,6 +347,18 @@ class TrainerController(MainController):
         self.view.statusBar().showMessage(
             f"Training epoch {epoch + 1}/{total_epochs}: loss={train_loss:.4f} test={test_loss:.4f}"
         )
+
+    @staticmethod
+    def _has_semantic_class_maps(class_maps):
+        for cmap in class_maps or []:
+            if cmap is None:
+                continue
+            try:
+                if int(np.max(cmap)) >= 1:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def handle_training_progress_remote(self, stage, message):
         safe_message = self._sanitize_remote_message(message)

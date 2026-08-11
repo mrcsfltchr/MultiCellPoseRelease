@@ -6,7 +6,6 @@ import logging
 import numpy as np
 from guv_app.services import training_service as training_service_module
 from guv_app.services.training_service import TrainingService
-from cellpose.models import CellposeModel
 
 _logger = logging.getLogger(__name__)
 
@@ -55,7 +54,6 @@ class TrainingWorker(QObject):
                 )
                 base_model = "cpsam"
 
-            net = None
             class_max = None
             if self.class_maps:
                 for cmap in self.class_maps:
@@ -67,11 +65,14 @@ class TrainingWorker(QObject):
                             class_max = vmax
                     except Exception:
                         continue
-            if class_max is not None and class_max >= 1 and os.path.basename(str(base_model)) == "cpsam":
-                net = training_service_module._initialize_class_net(nclasses=class_max + 1)
-            else:
-                model = CellposeModel(pretrained_model=base_model, gpu=True)
-                net = model.net
+            semantic_classes = None
+            if self.config.semantic_training and class_max is not None and class_max >= 1:
+                semantic_classes = class_max + 1
+            net = training_service_module.initialize_training_net(
+                base_model,
+                semantic_classes=semantic_classes,
+                use_gpu=True,
+            )
 
             training_service = TrainingService(net=net)
 

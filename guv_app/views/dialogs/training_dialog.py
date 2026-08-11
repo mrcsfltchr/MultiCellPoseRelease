@@ -128,6 +128,14 @@ class TrainingConfigDialog(QDialog):
         self.class_loss_weight_spin.setValue(float(default_config.class_loss_weight))
         advanced_form.addRow("Class loss weight:", self.class_loss_weight_spin)
 
+        self.semantic_training_checkbox = QCheckBox("Create/train semantic class head")
+        self.semantic_training_checkbox.setChecked(bool(default_config.semantic_training))
+        self.semantic_training_checkbox.setToolTip(
+            "When class labels are present, expand the selected base model so it predicts "
+            "semantic classes as well as Cellpose flows/cellprob."
+        )
+        advanced_form.addRow("Semantic training:", self.semantic_training_checkbox)
+
         self.min_masks_spin = QSpinBox()
         self.min_masks_spin.setRange(0, 100000)
         self.min_masks_spin.setValue(default_config.min_train_masks)
@@ -260,6 +268,7 @@ class TrainingConfigDialog(QDialog):
             scale_range=float(self.scale_range_spin.value()),
             seg_loss_weight=float(self.seg_loss_weight_spin.value()),
             class_loss_weight=float(self.class_loss_weight_spin.value()),
+            semantic_training=bool(self.semantic_training_checkbox.isChecked()),
             min_train_masks=int(self.min_masks_spin.value()),
             use_lora=bool(self.use_lora_checkbox.isChecked()),
             lora_blocks=int(self.lora_blocks_spin.value()),
