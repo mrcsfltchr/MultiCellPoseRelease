@@ -182,7 +182,8 @@ def _read_training_label_file(filename):
 
 
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
-               normalize_params={"normalize": False}, keep_label_first_channel=False):
+               normalize_params={"normalize": False}, channel_axis=None,
+               keep_label_first_channel=False):
     """
     Get a batch of images and labels.
 
@@ -193,6 +194,7 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         files (list or None): List of file paths for images.
         labels_files (list or None): List of file paths for labels.
         normalize_params (dict): Dictionary of parameters for image normalization (will be faster, if loading from files to pre-normalize).
+        channel_axis (int or None): Axis of the channel dimension when loading images from files.
 
     Returns:
         tuple: A tuple containing two lists: the batch of images and the batch of labels.
@@ -200,7 +202,7 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
     if data is None:
         lbls = None
         imgs = [io.imread(files[i]) for i in inds]
-        imgs = _reshape_norm(imgs, normalize_params=normalize_params)
+        imgs = _reshape_norm(imgs, channel_axis=channel_axis, normalize_params=normalize_params)
         if labels_files is not None:
             lbls = []
             for i in inds:
