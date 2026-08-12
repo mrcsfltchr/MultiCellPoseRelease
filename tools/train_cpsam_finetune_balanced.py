@@ -985,6 +985,12 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--scale-range", type=float, default=0.5)
     parser.add_argument("--seg-loss-weight", type=float, default=0.1)
     parser.add_argument(
+        "--class-loss-weight",
+        type=float,
+        default=1.0,
+        help="Scalar multiplier for semantic categorical loss; frequency class weights are still applied inside that loss.",
+    )
+    parser.add_argument(
         "--semantic-classes",
         type=int,
         default=0,
@@ -1412,6 +1418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_delta=args.early_stop_min_delta,
         model_name=model_name,
         seg_loss_weight=args.seg_loss_weight,
+        class_loss_weight=args.class_loss_weight,
         class_weights=class_weights,
         keep_label_first_channel=lazy_semantic,
     )
@@ -1432,6 +1439,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "semantic_classes": args.semantic_classes,
                 "semantic_class_weights": class_weights.tolist() if class_weights is not None else None,
                 "semantic_class_weighted_loss": bool(class_weights is not None),
+                "class_loss_weight": args.class_loss_weight,
                 "semantic_valid_class_maps": (
                     len(train_class_prob_rows) if lazy_semantic else len(valid_class_maps(train_class_maps))
                 ) if args.semantic_classes > 0 else 0,

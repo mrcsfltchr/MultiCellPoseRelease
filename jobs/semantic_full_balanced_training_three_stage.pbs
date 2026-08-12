@@ -1,21 +1,20 @@
 #!/bin/bash
-#PBS -N semantic_full_balanced
+#PBS -N semantic_full_balanced_3stage
 #PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
-#PBS -l walltime=18:00:00
+#PBS -l walltime=72:00:00
 #PBS -koed
 
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$HOME/MultiCellPose-public}"
 ROOT_DIRS="${ROOT_DIRS:-$HOME/FoundationTrain $HOME/cpsamOODtest}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/MCP_paper/semantic_full_balanced_training}"
+OUTPUT_DIR="${OUTPUT_DIR:-$HOME/MCP_paper/semantic_full_balanced_training_three_stage}"
 CONDA_ENV="${CONDA_ENV:-mcp_pub}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.1}"
 
 BASE_MODEL="${BASE_MODEL:-cpsam}"
-MODEL_NAME="${MODEL_NAME:-guvpose_semantic_full_balanced}"
+MODEL_NAME="${MODEL_NAME:-guvpose_semantic_full_balanced_three_stage}"
 SEMANTIC_CLASSES="${SEMANTIC_CLASSES:-4}"
-EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 B_SIZE="${B_SIZE:-256}"
 MAX_TRAIN_RECORDS="${MAX_TRAIN_RECORDS:-0}"
@@ -26,9 +25,6 @@ NIMG_PER_EPOCH="${NIMG_PER_EPOCH:-0}"
 NPZ_MASK_CHANNEL="${NPZ_MASK_CHANNEL:-last}"
 NPZ_CACHE_DIR="${NPZ_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/semantic_full_balanced_npz_cache}"
 LAZY_SEMANTIC_CACHE_DIR="${LAZY_SEMANTIC_CACHE_DIR:-${TMPDIR:-$HOME/ephemeral}/semantic_full_balanced_lazy_semantic_cache}"
-SEMANTIC_CACHE_ONLY="${SEMANTIC_CACHE_ONLY:-false}"
-SEMANTIC_CACHE_SHARD_INDEX="${SEMANTIC_CACHE_SHARD_INDEX:-0}"
-SEMANTIC_CACHE_NUM_SHARDS="${SEMANTIC_CACHE_NUM_SHARDS:-1}"
 CHANNEL_SAMPLING_MODE="${CHANNEL_SAMPLING_MODE:-single-and-all}"
 MAX_ALL_CHANNEL_COMBOS="${MAX_ALL_CHANNEL_COMBOS:-2}"
 CHANNEL_SAMPLING_VAL="${CHANNEL_SAMPLING_VAL:-true}"
@@ -36,8 +32,6 @@ UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-3}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SCALE_RANGE="${SCALE_RANGE:-0.5}"
-SEG_LOSS_WEIGHT="${SEG_LOSS_WEIGHT:-0.05}"
-CLASS_LOSS_WEIGHT="${CLASS_LOSS_WEIGHT:-1.0}"
 VAL_RATIO="${VAL_RATIO:-0.1}"
 TEST_RATIO="${TEST_RATIO:-0.1}"
 SEED="${SEED:-17}"
@@ -45,6 +39,18 @@ EARLY_STOP="${EARLY_STOP:-false}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-5}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
 REDO_SPLITS="${REDO_SPLITS:-false}"
+
+PHASE1_EPOCHS="${PHASE1_EPOCHS:-300}"
+PHASE1_SEG_LOSS_WEIGHT="${PHASE1_SEG_LOSS_WEIGHT:-0.05}"
+PHASE1_CLASS_LOSS_WEIGHT="${PHASE1_CLASS_LOSS_WEIGHT:-1.0}"
+
+PHASE2_EPOCHS="${PHASE2_EPOCHS:-100}"
+PHASE2_SEG_LOSS_WEIGHT="${PHASE2_SEG_LOSS_WEIGHT:-0.5}"
+PHASE2_CLASS_LOSS_WEIGHT="${PHASE2_CLASS_LOSS_WEIGHT:-0.5}"
+
+PHASE3_EPOCHS="${PHASE3_EPOCHS:-50}"
+PHASE3_SEG_LOSS_WEIGHT="${PHASE3_SEG_LOSS_WEIGHT:-1.0}"
+PHASE3_CLASS_LOSS_WEIGHT="${PHASE3_CLASS_LOSS_WEIGHT:-0.1}"
 
 cd "$REPO_DIR"
 
@@ -68,21 +74,22 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p "$NPZ_CACHE_DIR"
 mkdir -p "$LAZY_SEMANTIC_CACHE_DIR"
 
+SPLIT_MANIFEST="${SPLIT_MANIFEST:-$OUTPUT_DIR/cpsam_finetune_splits.json}"
+
 if [ "$CHANNEL_SAMPLING_VAL" = "true" ] || [ "$CHANNEL_SAMPLING_VAL" = "1" ] || [ "$CHANNEL_SAMPLING_VAL" = "yes" ]; then
     CHANNEL_SAMPLING_VAL_FLAG="--channel-sampling-val"
 else
     CHANNEL_SAMPLING_VAL_FLAG="--no-channel-sampling-val"
 fi
 
-EXTRA_FLAGS=()
+EARLY_STOP_FLAGS=()
 if [ "$EARLY_STOP" = "true" ] || [ "$EARLY_STOP" = "1" ] || [ "$EARLY_STOP" = "yes" ]; then
-    EXTRA_FLAGS+=("--early-stop")
+    EARLY_STOP_FLAGS+=("--early-stop")
 fi
+
+REDO_SPLITS_FLAGS=()
 if [ "$REDO_SPLITS" = "true" ] || [ "$REDO_SPLITS" = "1" ] || [ "$REDO_SPLITS" = "yes" ]; then
-    EXTRA_FLAGS+=("--redo-splits")
-fi
-if [ "$SEMANTIC_CACHE_ONLY" = "true" ] || [ "$SEMANTIC_CACHE_ONLY" = "1" ] || [ "$SEMANTIC_CACHE_ONLY" = "yes" ]; then
-    EXTRA_FLAGS+=("--semantic-cache-only")
+    REDO_SPLITS_FLAGS+=("--redo-splits")
 fi
 
 echo "Job ID: ${PBS_JOBID:-unknown}"
@@ -97,7 +104,6 @@ echo "CUDA_MODULE=$CUDA_MODULE"
 echo "BASE_MODEL=$BASE_MODEL"
 echo "MODEL_NAME=$MODEL_NAME"
 echo "SEMANTIC_CLASSES=$SEMANTIC_CLASSES"
-echo "EPOCHS=$EPOCHS"
 echo "BATCH_SIZE=$BATCH_SIZE"
 echo "B_SIZE=$B_SIZE"
 echo "MAX_TRAIN_RECORDS=$MAX_TRAIN_RECORDS"
@@ -108,9 +114,6 @@ echo "NIMG_PER_EPOCH=$NIMG_PER_EPOCH"
 echo "NPZ_MASK_CHANNEL=$NPZ_MASK_CHANNEL"
 echo "NPZ_CACHE_DIR=$NPZ_CACHE_DIR"
 echo "LAZY_SEMANTIC_CACHE_DIR=$LAZY_SEMANTIC_CACHE_DIR"
-echo "SEMANTIC_CACHE_ONLY=$SEMANTIC_CACHE_ONLY"
-echo "SEMANTIC_CACHE_SHARD_INDEX=$SEMANTIC_CACHE_SHARD_INDEX"
-echo "SEMANTIC_CACHE_NUM_SHARDS=$SEMANTIC_CACHE_NUM_SHARDS"
 echo "CHANNEL_SAMPLING_MODE=$CHANNEL_SAMPLING_MODE"
 echo "MAX_ALL_CHANNEL_COMBOS=$MAX_ALL_CHANNEL_COMBOS"
 echo "CHANNEL_SAMPLING_VAL=$CHANNEL_SAMPLING_VAL"
@@ -118,45 +121,74 @@ echo "UNFREEZE_BLOCKS=$UNFREEZE_BLOCKS"
 echo "LEARNING_RATE=$LEARNING_RATE"
 echo "WEIGHT_DECAY=$WEIGHT_DECAY"
 echo "SCALE_RANGE=$SCALE_RANGE"
-echo "SEG_LOSS_WEIGHT=$SEG_LOSS_WEIGHT"
-echo "CLASS_LOSS_WEIGHT=$CLASS_LOSS_WEIGHT"
+echo "SPLIT_MANIFEST=$SPLIT_MANIFEST"
 echo "EARLY_STOP=$EARLY_STOP"
 echo "EARLY_STOP_PATIENCE=$EARLY_STOP_PATIENCE"
 echo "EARLY_STOP_MIN_DELTA=$EARLY_STOP_MIN_DELTA"
 
-python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
-    --root-dirs $ROOT_DIRS \
-    --output-dir "$OUTPUT_DIR" \
-    --base-model "$BASE_MODEL" \
-    --model-name "$MODEL_NAME" \
-    --semantic-classes "$SEMANTIC_CLASSES" \
-    --epochs "$EPOCHS" \
-    --batch-size "$BATCH_SIZE" \
-    --bsize "$B_SIZE" \
-    --max-train-records-by-path FoundationTrain="$MAX_FOUNDATION_TRAIN_RECORDS" cpsamOODtest="$MAX_NEW_DATASET_TRAIN_RECORDS" \
-    --max-train-records "$MAX_TRAIN_RECORDS" \
-    --max-val-records "$MAX_VAL_RECORDS" \
-    --nimg-per-epoch "$NIMG_PER_EPOCH" \
-    --npz-mask-channel "$NPZ_MASK_CHANNEL" \
-    --npz-cache-dir "$NPZ_CACHE_DIR" \
-    --lazy-semantic-cache-dir "$LAZY_SEMANTIC_CACHE_DIR" \
-    --semantic-cache-shard-index "$SEMANTIC_CACHE_SHARD_INDEX" \
-    --semantic-cache-num-shards "$SEMANTIC_CACHE_NUM_SHARDS" \
-    --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
-    --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
-    "$CHANNEL_SAMPLING_VAL_FLAG" \
-    --learning-rate "$LEARNING_RATE" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --scale-range "$SCALE_RANGE" \
-    --seg-loss-weight "$SEG_LOSS_WEIGHT" \
-    --class-loss-weight "$CLASS_LOSS_WEIGHT" \
-    --unfreeze-blocks "$UNFREEZE_BLOCKS" \
-    --val-ratio "$VAL_RATIO" \
-    --test-ratio "$TEST_RATIO" \
-    --seed "$SEED" \
-    --balance-mode source \
-    --early-stop-patience "$EARLY_STOP_PATIENCE" \
-    --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
-    "${EXTRA_FLAGS[@]}"
+run_phase() {
+    local phase_name="$1"
+    local base_model="$2"
+    local model_name="$3"
+    local epochs="$4"
+    local seg_loss_weight="$5"
+    local class_loss_weight="$6"
 
+    echo "===== ${phase_name} start: $(date) ====="
+    echo "${phase_name}: BASE_MODEL=$base_model"
+    echo "${phase_name}: MODEL_NAME=$model_name"
+    echo "${phase_name}: EPOCHS=$epochs"
+    echo "${phase_name}: SEG_LOSS_WEIGHT=$seg_loss_weight"
+    echo "${phase_name}: CLASS_LOSS_WEIGHT=$class_loss_weight"
+
+    python "$REPO_DIR/tools/train_cpsam_finetune_balanced.py" \
+        --root-dirs $ROOT_DIRS \
+        --output-dir "$OUTPUT_DIR" \
+        --split-manifest "$SPLIT_MANIFEST" \
+        --base-model "$base_model" \
+        --model-name "$model_name" \
+        --semantic-classes "$SEMANTIC_CLASSES" \
+        --epochs "$epochs" \
+        --batch-size "$BATCH_SIZE" \
+        --bsize "$B_SIZE" \
+        --max-train-records-by-path FoundationTrain="$MAX_FOUNDATION_TRAIN_RECORDS" cpsamOODtest="$MAX_NEW_DATASET_TRAIN_RECORDS" \
+        --max-train-records "$MAX_TRAIN_RECORDS" \
+        --max-val-records "$MAX_VAL_RECORDS" \
+        --nimg-per-epoch "$NIMG_PER_EPOCH" \
+        --npz-mask-channel "$NPZ_MASK_CHANNEL" \
+        --npz-cache-dir "$NPZ_CACHE_DIR" \
+        --lazy-semantic-cache-dir "$LAZY_SEMANTIC_CACHE_DIR" \
+        --semantic-cache-shard-index 0 \
+        --semantic-cache-num-shards 1 \
+        --channel-sampling-mode "$CHANNEL_SAMPLING_MODE" \
+        --max-all-channel-combos "$MAX_ALL_CHANNEL_COMBOS" \
+        "$CHANNEL_SAMPLING_VAL_FLAG" \
+        --learning-rate "$LEARNING_RATE" \
+        --weight-decay "$WEIGHT_DECAY" \
+        --scale-range "$SCALE_RANGE" \
+        --seg-loss-weight "$seg_loss_weight" \
+        --class-loss-weight "$class_loss_weight" \
+        --unfreeze-blocks "$UNFREEZE_BLOCKS" \
+        --val-ratio "$VAL_RATIO" \
+        --test-ratio "$TEST_RATIO" \
+        --seed "$SEED" \
+        --balance-mode source \
+        --early-stop-patience "$EARLY_STOP_PATIENCE" \
+        --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+        "${EARLY_STOP_FLAGS[@]}" \
+        "${REDO_SPLITS_FLAGS[@]}"
+
+    echo "===== ${phase_name} finish: $(date) ====="
+}
+
+PHASE1_MODEL="${MODEL_NAME}_phase1_seg005_cls100"
+PHASE2_MODEL="${MODEL_NAME}_phase2_seg050_cls050"
+PHASE3_MODEL="${MODEL_NAME}_phase3_seg100_cls010"
+
+run_phase "phase1" "$BASE_MODEL" "$PHASE1_MODEL" "$PHASE1_EPOCHS" "$PHASE1_SEG_LOSS_WEIGHT" "$PHASE1_CLASS_LOSS_WEIGHT"
+run_phase "phase2" "$OUTPUT_DIR/$PHASE1_MODEL" "$PHASE2_MODEL" "$PHASE2_EPOCHS" "$PHASE2_SEG_LOSS_WEIGHT" "$PHASE2_CLASS_LOSS_WEIGHT"
+run_phase "phase3" "$OUTPUT_DIR/$PHASE2_MODEL" "$PHASE3_MODEL" "$PHASE3_EPOCHS" "$PHASE3_SEG_LOSS_WEIGHT" "$PHASE3_CLASS_LOSS_WEIGHT"
+
+cp "$OUTPUT_DIR/$PHASE3_MODEL" "$OUTPUT_DIR/$MODEL_NAME"
+echo "Final staged model copied to $OUTPUT_DIR/$MODEL_NAME"
 echo "Finish: $(date)"
