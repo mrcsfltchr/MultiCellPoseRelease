@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N semantic_full_balanced_3stage
-#PBS -l select=1:ncpus=16:ngpus=1:mem=48gb
-#PBS -l walltime=72:00:00
+#PBS -l select=1:ncpus=16:ngpus=1:mem=24gb
+#PBS -l walltime=16:00:00
 #PBS -koed
 
 set -euo pipefail
