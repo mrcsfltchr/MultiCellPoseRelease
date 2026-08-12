@@ -140,7 +140,10 @@ class AnalyzerController(MainController):
                 return
             plugin_params[plugin.name] = params
 
-        if self._plugin_supports_visualization(plugin):
+        image_files = self._folder_image_files(folder_path)
+        skip_folder_visualization = self._plugin_supports_visualization(plugin) and len(image_files) > 1
+
+        if self._plugin_supports_visualization(plugin) and not skip_folder_visualization:
             if self.model.image_data is None or self.model.masks is None:
                 self.view.show_progress("Load an image with masks to preview plugin visualization.")
                 return
@@ -171,6 +174,17 @@ class AnalyzerController(MainController):
             )
             return
 
+        if skip_folder_visualization:
+            self.active_plugin = None
+            self.active_plugin_params = {}
+            self.pending_visualization_generation = False
+            self.visualization_masks_by_file = {}
+            if hasattr(self.view, "set_plugin_hint_visible"):
+                self.view.set_plugin_hint_visible(False)
+            self.view.show_progress(
+                f"{plugin.name} supports visualization, but folder contains multiple image files; running direct CSV export."
+            )
+
         self.pending_folder_path = None
         self.pending_folder_plugin_params = None
         self._start_statistics_worker(
@@ -179,6 +193,7 @@ class AnalyzerController(MainController):
             plugin_params=plugin_params,
             visualization_masks_by_file=None,
             series_index=series_index,
+            image_files=image_files or None,
         )
 
     def _on_thread_finished(self):
@@ -418,6 +433,13 @@ class AnalyzerController(MainController):
             params[name].setdefault("object_ids_by_mask", object_ids)
             params[name].setdefault("channel_segmentations", channel_segmentations)
         return params
+
+    @staticmethod
+    def _folder_image_files(folder_path):
+        try:
+            return io.get_image_files(folder_path, '_masks')
+        except Exception:
+            return []
 
     def _start_statistics_worker(self, folder_path, plugins, plugin_params, visualization_masks_by_file, series_index=None,
                                  visualize_only=False, image_files=None):
