@@ -181,14 +181,40 @@ run_phase() {
     echo "===== ${phase_name} finish: $(date) ====="
 }
 
+save_stage_model() {
+    local phase_model="$1"
+    local stage_model="$2"
+    local source_path="$OUTPUT_DIR/$phase_model"
+    local stage_path="$OUTPUT_DIR/$stage_model"
+    local temp_path="${stage_path}.tmp"
+
+    if [ ! -s "$source_path" ]; then
+        echo "ERROR: expected trained model was not created: $source_path" >&2
+        exit 3
+    fi
+
+    # Copy via a temporary file so evaluation jobs never observe a partial model.
+    cp "$source_path" "$temp_path"
+    mv -f "$temp_path" "$stage_path"
+    echo "Saved stage model: $stage_path"
+}
+
 PHASE1_MODEL="${MODEL_NAME}_phase1_seg005_cls100"
 PHASE2_MODEL="${MODEL_NAME}_phase2_seg050_cls050"
 PHASE3_MODEL="${MODEL_NAME}_phase3_seg100_cls010"
+STAGE1_MODEL="${MODEL_NAME}_after_stage1"
+STAGE2_MODEL="${MODEL_NAME}_after_stage2"
+STAGE3_MODEL="${MODEL_NAME}_after_stage3"
 
 run_phase "phase1" "$BASE_MODEL" "$PHASE1_MODEL" "$PHASE1_EPOCHS" "$PHASE1_SEG_LOSS_WEIGHT" "$PHASE1_CLASS_LOSS_WEIGHT"
-run_phase "phase2" "$OUTPUT_DIR/$PHASE1_MODEL" "$PHASE2_MODEL" "$PHASE2_EPOCHS" "$PHASE2_SEG_LOSS_WEIGHT" "$PHASE2_CLASS_LOSS_WEIGHT"
-run_phase "phase3" "$OUTPUT_DIR/$PHASE2_MODEL" "$PHASE3_MODEL" "$PHASE3_EPOCHS" "$PHASE3_SEG_LOSS_WEIGHT" "$PHASE3_CLASS_LOSS_WEIGHT"
+save_stage_model "$PHASE1_MODEL" "$STAGE1_MODEL"
 
-cp "$OUTPUT_DIR/$PHASE3_MODEL" "$OUTPUT_DIR/$MODEL_NAME"
+run_phase "phase2" "$OUTPUT_DIR/$STAGE1_MODEL" "$PHASE2_MODEL" "$PHASE2_EPOCHS" "$PHASE2_SEG_LOSS_WEIGHT" "$PHASE2_CLASS_LOSS_WEIGHT"
+save_stage_model "$PHASE2_MODEL" "$STAGE2_MODEL"
+
+run_phase "phase3" "$OUTPUT_DIR/$STAGE2_MODEL" "$PHASE3_MODEL" "$PHASE3_EPOCHS" "$PHASE3_SEG_LOSS_WEIGHT" "$PHASE3_CLASS_LOSS_WEIGHT"
+save_stage_model "$PHASE3_MODEL" "$STAGE3_MODEL"
+
+cp "$OUTPUT_DIR/$STAGE3_MODEL" "$OUTPUT_DIR/$MODEL_NAME"
 echo "Final staged model copied to $OUTPUT_DIR/$MODEL_NAME"
 echo "Finish: $(date)"
