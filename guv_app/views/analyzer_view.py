@@ -15,9 +15,12 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QInputDialog,
+    QMessageBox,
 )
 from PyQt6 import sip
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+import numpy as np
+import pyqtgraph as pg
 
 from .base_view import BaseMainView
 from guv_app.views.dialogs.plugin_config_dialog import PluginConfigDialog, DynamicPluginConfigWidget
@@ -33,6 +36,9 @@ class AnalyzerView(BaseMainView):
     run_plugin_requested = pyqtSignal()
     run_plugin_series_requested = pyqtSignal()
     finalize_plugin_requested = pyqtSignal()
+    lock_class_track_requested = pyqtSignal()
+    begin_class_track_selection_requested = pyqtSignal()
+    cancel_class_track_selection_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -47,6 +53,14 @@ class AnalyzerView(BaseMainView):
         self.run_plugin_series_button = QPushButton("Run Plugin on Multi-Image")
         self.run_plugin_series_button.setEnabled(False)
         self.run_plugin_folder_button = QPushButton("Run Plugins on Folder")
+        self.begin_class_track_selection_button = QPushButton("Select Tracks to Reclassify")
+        self.lock_class_track_button = QPushButton("Apply Class to 0 Tracks...")
+        self.cancel_class_track_selection_button = QPushButton("Cancel Track Selection")
+        self.lock_class_track_button.setVisible(False)
+        self.cancel_class_track_selection_button.setVisible(False)
+        self.lock_class_track_button.setToolTip(
+            "Apply the active class to every selected object's class-agnostic track."
+        )
         self.finalize_plugin_button = QPushButton("Finalize Plugin Analysis")
         self.plugin_hint_label = QLabel(
             "Plugin visualization mode: edit masks, then press Finalize Plugin Analysis."
@@ -66,6 +80,9 @@ class AnalyzerView(BaseMainView):
         layout.addWidget(self.run_plugin_button)
         layout.addWidget(self.run_plugin_series_button)
         layout.addWidget(self.run_plugin_folder_button)
+        layout.addWidget(self.begin_class_track_selection_button)
+        layout.addWidget(self.lock_class_track_button)
+        layout.addWidget(self.cancel_class_track_selection_button)
         layout.addWidget(self.finalize_plugin_button)
         layout.addWidget(self.plugin_hint_label)
         layout.addWidget(self.analysis_progress_bar)
@@ -80,6 +97,7 @@ class AnalyzerView(BaseMainView):
         )
         self._analysis_dock_collapsed = False
         self._analysis_dock_expanded_width = 320
+        self._class_track_label_items = []
 
         title_bar = QWidget(self.analysis_dock)
         title_layout = QHBoxLayout(title_bar)
@@ -104,6 +122,55 @@ class AnalyzerView(BaseMainView):
         self.run_plugin_series_button.clicked.connect(self.run_plugin_series_requested.emit)
         self.run_plugin_folder_button.clicked.connect(self.export_csv_requested.emit)
         self.finalize_plugin_button.clicked.connect(self.finalize_plugin_requested.emit)
+        self.lock_class_track_button.clicked.connect(self.lock_class_track_requested.emit)
+        self.begin_class_track_selection_button.clicked.connect(
+            self.begin_class_track_selection_requested.emit
+        )
+        self.cancel_class_track_selection_button.clicked.connect(
+            self.cancel_class_track_selection_requested.emit
+        )
+        self._cancel_class_track_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._cancel_class_track_shortcut.activated.connect(
+            self.cancel_class_track_selection_requested.emit
+        )
+
+    def set_class_track_selection_mode(self, enabled: bool, selected_ids=()) -> None:
+        count = len(selected_ids)
+        self.begin_class_track_selection_button.setVisible(not enabled)
+        self.lock_class_track_button.setVisible(enabled)
+        self.cancel_class_track_selection_button.setVisible(enabled)
+        suffix = "s" if count != 1 else ""
+        self.lock_class_track_button.setText(f"Apply Class to {count} Track{suffix}...")
+        self.lock_class_track_button.setEnabled(enabled and count > 0)
+        self._update_class_track_markers(selected_ids if enabled else ())
+
+    def _update_class_track_markers(self, selected_ids) -> None:
+        for item in self._class_track_label_items:
+            self.view_box.removeItem(item)
+        self._class_track_label_items = []
+        masks = getattr(getattr(self, "model", None), "cellpix", None)
+        if masks is None:
+            return
+        arr = np.squeeze(np.asarray(masks))
+        for number, mask_id in enumerate(sorted(selected_ids), start=1):
+            yy, xx = np.nonzero(arr == int(mask_id))
+            if not yy.size:
+                continue
+            label = pg.TextItem(str(number), color=(255, 230, 0), anchor=(0.5, 0.5))
+            label.setZValue(40)
+            label.setPos(float(xx.mean()), float(yy.mean()))
+            self.view_box.addItem(label)
+            self._class_track_label_items.append(label)
+
+    def confirm_class_track_override(self, message: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Apply class to tracked object",
+            message,
+            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Apply
 
     def _add_masks_menu(self) -> None:
         menubar = self.menuBar()

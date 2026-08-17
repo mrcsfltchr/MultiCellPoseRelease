@@ -11,6 +11,11 @@ from guv_app.plugins.interface import AnalysisPlugin
 from guv_app.data_models.configs import BatchConfig
 from cellpose import io
 import os
+import uuid
+from guv_app.workers.class_lock_tracking_worker import (
+    ClassLockApplyWorker,
+    ClassLockPreviewWorker,
+)
 
 class AnalyzerController(MainController):
     def __init__(self, model, view, services):
@@ -26,6 +31,13 @@ class AnalyzerController(MainController):
         self.pending_visualization_generation = False
         self.visualization_masks_by_file = {}
         self.rejected_object_tracking_track_ids = set()
+        self._class_lock_preview = None
+        self._class_lock_applied_result = None
+        self._class_lock_worker = None
+        self._class_lock_thread = None
+        self._class_lock_busy = False
+        self._class_lock_error = False
+        self._class_track_selection_mode = False
         # Analyzer prefers predictions
         self.mask_load_priority = ['_pred.npy', '_seg.npy']
 
@@ -42,6 +54,219 @@ class AnalyzerController(MainController):
         if hasattr(self.view, "run_plugin_series_requested"):
             self.view.run_plugin_series_requested.connect(self.on_run_plugin_series)
         self.view.finalize_plugin_requested.connect(self.on_finalize_plugin_analysis)
+        if hasattr(self.view, "lock_class_track_requested"):
+            self.view.lock_class_track_requested.connect(self.handle_lock_class_across_track)
+        self.view.begin_class_track_selection_requested.connect(
+            self.begin_class_track_selection
+        )
+        self.view.cancel_class_track_selection_requested.connect(
+            self.cancel_class_track_selection
+        )
+
+    @pyqtSlot()
+    def begin_class_track_selection(self):
+        if self._class_lock_busy:
+            return
+        self._class_track_selection_mode = True
+        self.model.clear_selected_masks()
+        self.view.set_class_track_selection_mode(True, ())
+        self.model.trigger_view_update()
+        self.view.statusBar().showMessage(
+            "Track selection active: click objects to toggle them; Esc cancels."
+        )
+
+    @pyqtSlot()
+    def cancel_class_track_selection(self):
+        if not self._class_track_selection_mode or self._class_lock_busy:
+            return
+        self._class_track_selection_mode = False
+        self.model.clear_selected_masks()
+        self.view.set_class_track_selection_mode(False, ())
+        self.model.trigger_view_update()
+        self.view.statusBar().showMessage("Track selection cancelled.")
+
+    def handle_select_mask(self, y, x):
+        if not self._class_track_selection_mode:
+            return super().handle_select_mask(y, x)
+        if self.model.cellpix is None or not (0 <= y < self.model.Ly and 0 <= x < self.model.Lx):
+            return
+        mask_id = int(self.model.cellpix[0, y, x])
+        if mask_id <= 0:
+            return
+        if mask_id in self.model.selected_mask_ids:
+            self.model.selected_mask_ids.remove(mask_id)
+        else:
+            self.model.selected_mask_ids.add(mask_id)
+        selected = sorted(self.model.get_selected_mask_ids())
+        self.view.set_class_track_selection_mode(True, selected)
+        self.view.statusBar().showMessage(
+            f"Selected {len(selected)} track{'s' if len(selected) != 1 else ''}; "
+            "click another object or Apply."
+        )
+        self.model.trigger_view_update()
+
+    @pyqtSlot()
+    def handle_lock_class_across_track(self):
+        if self._class_lock_busy:
+            self.view.show_progress("A class-lock operation is already running.")
+            return
+        selected = sorted(self.model.get_selected_mask_ids())
+        if not selected:
+            self.view.show_progress("Select at least one object before applying a class across tracks.")
+            return
+        if not getattr(self.model, "frame_refs", None) or len(self.model.frame_refs) < 2:
+            self.view.show_progress("The current image is not a multi-timepoint series.")
+            return
+        frame_specs = []
+        for ref in self.model.frame_refs:
+            base_file, frame_id = self.image_service.split_image_reference(ref)
+            path = self.image_service.build_frame_path(base_file, frame_id, "_pred.npy")
+            frame_specs.append((frame_id, path))
+        diameter = float(self.view.control_panel.diameter_spinbox.value())
+        self._class_lock_busy = True
+        self._class_lock_error = False
+        self._class_lock_preview = None
+        self._class_lock_worker = ClassLockPreviewWorker(
+            frame_specs=frame_specs,
+            anchor_frame_id=self.model.frame_id,
+            anchor_mask_ids=selected,
+            target_class=int(self.model.current_class),
+            max_displacement=max(5.0, 2.0 * diameter),
+        )
+        self._class_lock_thread = QThread()
+        self._class_lock_worker.moveToThread(self._class_lock_thread)
+        self._class_lock_thread.started.connect(self._class_lock_worker.run)
+        self._class_lock_worker.progress.connect(self._show_class_lock_progress)
+        self._class_lock_worker.preview_ready.connect(self._store_class_lock_preview)
+        self._class_lock_worker.error.connect(self._show_class_lock_error)
+        self._class_lock_worker.finished.connect(self._class_lock_thread.quit)
+        self._class_lock_worker.finished.connect(self._class_lock_worker.deleteLater)
+        self._class_lock_thread.finished.connect(self._on_class_lock_preview_finished)
+        self._class_lock_thread.finished.connect(self._class_lock_thread.deleteLater)
+        self.view.lock_class_track_button.setEnabled(False)
+        self.view.set_progress_busy(True, "Building class-agnostic object track…")
+        self._class_lock_thread.start()
+
+    def _show_class_lock_progress(self, message):
+        self.view.show_progress(message)
+        self.view.statusBar().showMessage(message)
+
+    def _show_class_lock_error(self, message):
+        self._class_lock_error = True
+        self.view.show_progress(f"Class-lock error: {message}")
+        self.view.statusBar().showMessage(f"Class-lock error: {message}")
+
+    def _store_class_lock_preview(self, preview):
+        self._class_lock_preview = preview
+
+    def _on_class_lock_preview_finished(self):
+        preview = self._class_lock_preview
+        self._class_lock_worker = None
+        self._class_lock_thread = None
+        self.view.set_progress_busy(False)
+        if preview is None or self._class_lock_error:
+            self._finish_class_lock()
+            return
+        tracks = preview["tracks"]
+        rows = []
+        total_frames = len(preview["frames"])
+        total_unique = len({(m.frame_index, m.mask_id) for members in tracks.values() for m in members})
+        for number, (anchor_id, members) in enumerate(tracks.items(), start=1):
+            indices = {member.frame_index for member in members}
+            scores = [m.score for m in members if m.frame_index != preview["anchor_index"]]
+            before = preview["anchor_index"] - min(indices)
+            after = max(indices) - preview["anchor_index"]
+            lost_before = preview["anchor_index"] - before
+            lost_after = total_frames - 1 - preview["anchor_index"] - after
+            rows.append(
+                f"Track {number} (mask {anchor_id}): {len(members)}/{total_frames} frames; "
+                f"lost before/after {lost_before}/{lost_after}; "
+                f"low-confidence {sum(score < 0.5 for score in scores)}"
+            )
+        message = (
+            f"Assign class {preview['target_class']} to {len(tracks)} selected tracks?\n\n"
+            + "\n".join(rows)
+            + "\n\n"
+            f"Unique object instances: {total_unique}\n"
+            f"Shared-mask conflicts: {len(preview['conflicts'])}\n\n"
+            "Tracking ignores the current semantic class.\n"
+            f"Maximum displacement: {preview['max_displacement']:.1f} px/frame\n"
+            "Mask geometry will not be changed."
+        )
+        if not self.view.confirm_class_track_override(message):
+            self._class_lock_preview = None
+            self.view.show_progress("Class-lock operation cancelled.")
+            print("Class lock: user cancelled apply", flush=True)
+            self._finish_class_lock()
+            return
+        print("Class lock: user confirmed apply; starting save worker", flush=True)
+        self._start_class_lock_apply(preview)
+
+    def _start_class_lock_apply(self, preview):
+        self._class_lock_applied_result = None
+        self._class_lock_error = False
+        override_id = f"class-lock-{uuid.uuid4()}"
+        self._class_lock_worker = ClassLockApplyWorker(preview, override_id)
+        self._class_lock_thread = QThread()
+        self._class_lock_worker.moveToThread(self._class_lock_thread)
+        self._class_lock_thread.started.connect(self._class_lock_worker.run)
+        self._class_lock_worker.progress.connect(self._show_class_lock_progress)
+        self._class_lock_worker.applied.connect(self._store_class_lock_applied_result)
+        self._class_lock_worker.error.connect(self._show_class_lock_error)
+        self._class_lock_worker.finished.connect(self._class_lock_thread.quit)
+        self._class_lock_worker.finished.connect(self._class_lock_worker.deleteLater)
+        self._class_lock_thread.finished.connect(self._on_class_lock_apply_finished)
+        self._class_lock_thread.finished.connect(self._class_lock_thread.deleteLater)
+        self.view.lock_class_track_button.setEnabled(False)
+        self.view.set_progress_busy(True, "Applying and verifying class corrections…")
+        self._class_lock_thread.start()
+
+    def _store_class_lock_applied_result(self, result):
+        self._class_lock_applied_result = result
+
+    def _on_class_lock_apply_finished(self):
+        result = self._class_lock_applied_result
+        self._class_lock_worker = None
+        self._class_lock_thread = None
+        self.view.set_progress_busy(False)
+        self._class_lock_preview = None
+        if result is None or self._class_lock_error:
+            self._finish_class_lock()
+            return
+        target_class = int(result["target_class"])
+        anchor_mask_ids = [int(value) for value in result["anchor_mask_ids"]]
+        for anchor_mask_id in anchor_mask_ids:
+            self.model.assign_class_to_mask(anchor_mask_id, target_class)
+        self.model.persist_current_channel_state()
+        self.model.clear_selected_masks()
+        self.model.trigger_view_update()
+        message = (
+            f"Applied class {target_class} to {len(anchor_mask_ids)} tracks and "
+            f"{result['verified_frames']} object instances "
+            f"({result['override_id']})."
+        )
+        self.view.show_progress(message)
+        self.view.statusBar().showMessage(message)
+        self._class_track_selection_mode = False
+        self.view.set_class_track_selection_mode(False, ())
+        self._finish_class_lock()
+
+    def _finish_class_lock(self):
+        self._class_lock_busy = False
+        self._class_lock_error = False
+        self._class_lock_worker = None
+        self._class_lock_thread = None
+        self.view.lock_class_track_button.setEnabled(True)
+
+    def cleanup_all_threads(self):
+        thread = self._class_lock_thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait()
+        self._class_lock_worker = None
+        self._class_lock_thread = None
+        self._class_lock_busy = False
+        super().cleanup_all_threads()
 
     @pyqtSlot(str)
     def on_folder_selected(self, folder_path):
