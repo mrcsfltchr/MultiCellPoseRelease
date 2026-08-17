@@ -1,6 +1,33 @@
 import numpy as np
 
 
+def discard_class_zero_instances(masks, classes):
+    """Remove class-0 instances and compact remaining mask IDs and classes.
+
+    ``classes`` is indexed by mask ID. A missing class entry is treated as
+    class 0 so malformed/unclassified predictions cannot become GUI objects.
+    Non-semantic results (``classes is None``) are returned unchanged.
+    """
+    if masks is None or classes is None:
+        return masks, classes
+
+    masks_arr = np.asarray(masks)
+    classes_arr = np.asarray(classes, dtype=np.int16)
+    filtered = np.zeros_like(masks_arr)
+    kept_classes = [0]
+    next_id = 1
+
+    for old_id in np.unique(masks_arr[masks_arr > 0]).astype(np.int64):
+        class_id = int(classes_arr[old_id]) if old_id < len(classes_arr) else 0
+        if class_id <= 0:
+            continue
+        filtered[masks_arr == old_id] = next_id
+        kept_classes.append(class_id)
+        next_id += 1
+
+    return filtered, np.asarray(kept_classes, dtype=np.int16)
+
+
 def build_classes_map_from_masks(masks, classes):
     """Build per-pixel class map from instance masks + per-instance class vector."""
     if masks is None or classes is None:

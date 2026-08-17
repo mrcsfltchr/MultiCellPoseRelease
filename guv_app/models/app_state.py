@@ -10,6 +10,7 @@ except ImportError:
 import os
 from guv_app.data_models.results import InferenceResult
 from cellpose import io, utils
+from cellpose.semantic_label_utils import discard_class_zero_instances
 from PyQt6.QtCore import QObject, pyqtSignal
 
 class ViewConfig:
@@ -1153,6 +1154,15 @@ class ApplicationStateModel(QObject):
         If it's a single image inference (no filename or matches current), update the view.
         If it's a batch result (has filename), save it to disk.
         """
+        # Predicted semantic class 0 is background/unclassified, not an object.
+        # Filter it before display, channel storage, frozen-mask merging, or save.
+        # Non-semantic inference has classes=None and remains unchanged.
+        if result.masks is not None and result.classes is not None:
+            result.masks, result.classes = discard_class_zero_instances(
+                result.masks, result.classes
+            )
+            result.outlines = None
+
         # 1. Update in-memory state first so save_prediction captures the latest channel data
         if result.masks is not None:
             filename_match = result.filename is None or result.filename == self.filename
